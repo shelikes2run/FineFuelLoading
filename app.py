@@ -10,11 +10,19 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 # CONFIG
 # ============================================================
-NIFC_PSA_URL = os.getenv(
-    "NIFC_PSA_URL",
-    "https://services1.arcgis.com/99lidPhWCzftIe9K/ArcGIS/rest/services/"
-    "Predictive_Service_Area_PSA_Boundaries_Public/FeatureServer/0/query",
+# Your GeoJSON PSA service (works in your environment)
+NIFC_PSA_GEOJSON = os.getenv(
+    "NIFC_PSA_GEOJSON",
+    "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
+    "DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer/0/query"
 )
+# Legacy (Esri JSON) — only used as a fallback if needed
+NIFC_PSA_ESRIJSON = os.getenv(
+    "NIFC_PSA_ESRIJSON",
+    "https://services1.arcgis.com/99lidPhWCzftIe9K/ArcGIS/rest/services/"
+    "Predictive_Service_Area_PSA_Boundaries_Public/FeatureServer/0/query"
+)
+
 RAP_URL = os.getenv(
     "RAP_URL",
     "https://us-central1-rap-data-365417.cloudfunctions.net/production16dayV3",
@@ -29,7 +37,7 @@ CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "21600"))  # 6 hours
 # ============================================================
 # APP SETUP
 # ============================================================
-app = FastAPI(title="CA PSA Herbaceous API", version="2.1.0")
+app = FastAPI(title="CA PSA Herbaceous API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -90,29 +98,6 @@ async def _http_post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 # HELPERS
 # ============================================================
-def _arcgis_query_params(where: str, f: str = "json", out_fields: str = "*", return_geometry: bool = True):
-    """Build standard ArcGIS REST query parameters."""
-    return {
-        "where": where,                # we will use "1=1" and filter client-side
-        "outFields": out_fields,       # safest on AO layers
-        "f": f,                        # Esri JSON (more reliable than geojson output)
-        "returnGeometry": "true" if return_geometry else "false",
-        "outSR": 4326,
-    }
-
-def _esri_polygon_to_geojson(esri_geom: Dict[str, Any]) -> Dict[str, Any]:
-    """Convert Esri polygon rings to GeoJSON Polygon."""
-    rings = esri_geom.get("rings") or []
-    if not rings:
-        raise ValueError("Empty Esri polygon.")
-    def _close(coords):
-        return coords if coords[0] == coords[-1] else coords + [coords[0]]
-    shell = _close([[x, y] for x, y in rings[0]])
-    holes = []
-    if len(rings) > 1:
-        holes = [_close([[x, y] for x, y in r]) for r in rings[1:]]
-    return {"type": "Polygon", "coordinates": [shell] + holes}
-
 def _last_n(rows: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
     if not rows:
         return []
@@ -124,42 +109,95 @@ async def _rap_for_polygon(geojson_polygon: Dict[str, Any], year: Optional[int])
         payload["year"] = int(year)
     return await _http_post_json(RAP_URL, payload)
 
+# ============================================================
+# PSA FETCHERS
+# ============================================================
+async def fetch_psas_geojson() -> Dict[str, Any]:
+    """
+    Preferred: fetch PSA features as GeoJSON from your working service.
+    """
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "f": "geojson",
+        "returnGeometry": "true",
+        "outSR": 4326
+    }
+    data = await _http_get_json(NIFC_PSA_GEOJSON, params)
+    # GeoJSON always has 'features' list
+    feats = data.get("features")
+    if not isinstance(feats, list) or not feats:
+        raise HTTPException(status_code=502, detail="PSA GeoJSON: no features returned")
+    return data
+
+async def fetch_psas_esrijson() -> Dict[str, Any]:
+    """
+    Fallback: fetch PSA as Esri JSON, return a GeoJSON-like dict.
+    (Converts Esri polygons to GeoJSON Polygons.)
+    """
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "f": "json",
+        "returnGeometry": "true",
+        "outSR": 4326,
+        "resultRecordCount": 5000
+    }
+    data = await _http_get_json(NIFC_PSA_ESRIJSON, params)
+    if "features" not in data or not data["features"]:
+        raise HTTPException(status_code=502, detail="PSA EsriJSON: no features returned")
+
+    def esri_to_geojson(poly_esri):
+        rings = poly_esri.get("rings") or []
+        if not rings:
+            return None
+        def close_ring(coords):
+            return coords if coords[0] == coords[-1] else coords + [coords[0]]
+        shell = close_ring([[x, y] for x, y in rings[0]])
+        holes = [close_ring([[x, y] for x, y in r]) for r in rings[1:]]
+        return {"type": "Polygon", "coordinates": [shell] + holes}
+
+    out_feats = []
+    for f in data["features"]:
+        attrs = f.get("attributes", {})
+        geom = f.get("geometry", {})
+        if "rings" not in geom:
+            continue
+        gj = esri_to_geojson(geom)
+        if not gj:
+            continue
+        out_feats.append({"type": "Feature", "geometry": gj, "properties": attrs})
+
+    if not out_feats:
+        raise HTTPException(status_code=502, detail="PSA EsriJSON: conversion produced no features")
+    return {"type": "FeatureCollection", "features": out_feats}
+
 async def fetch_ca_psas(gacc: Optional[str] = None) -> Dict[str, Any]:
     """
-    Get PSA features as Esri JSON (no server-side filter), then filter to CA + desired GACC(s) in code.
-    This avoids 400s some services return on certain where clauses or field-name case issues.
+    Try GeoJSON source first; if it fails, use EsriJSON fallback.
+    Then filter client-side to CA + requested GACC(s).
     """
-    params = _arcgis_query_params(
-        where="1=1",      # no filter here
-        f="json",
-        out_fields="*",
-        return_geometry=True
-    )
-    data = await _http_get_json(NIFC_PSA_URL, params)
+    try:
+        fc = await fetch_psas_geojson()
+    except Exception:
+        fc = await fetch_psas_esrijson()  # fallback
 
-    # Surface ArcGIS error objects if present
-    if isinstance(data, dict) and "error" in data:
-        msg = data["error"].get("message", "ArcGIS error")
-        details = data["error"].get("details", [])
-        raise HTTPException(status_code=502, detail=f"NIFC PSA error: {msg} {details}")
-
-    if "features" not in data:
-        raise HTTPException(status_code=502, detail="Unexpected PSA response (no 'features')")
-
-    # Client-side filter
-    wanted_gaccs = None
-    if gacc:
-        wanted_gaccs = {x.strip().upper() for x in gacc.split(",")}
+    feats = fc.get("features", [])
+    wanted_gaccs = {x.strip().upper() for x in gacc.split(",")} if gacc else None
 
     filtered = []
-    for f in data["features"]:
-        attrs = f.get("attributes", {}) or {}
-        state = (attrs.get("STATE") or attrs.get("State") or attrs.get("state"))
-        gacc_val = (attrs.get("GACC") or attrs.get("gacc"))
-        if state == "CA" and (wanted_gaccs is None or (gacc_val and gacc_val.upper() in wanted_gaccs)):
+    for f in feats:
+        props = f.get("properties", {}) or {}
+        state_val = props.get("STATE") or props.get("ST") or props.get("State") or props.get("STATE_NAME")
+        gacc_val  = props.get("GACC") or props.get("gacc")
+        if (state_val in ("CA", "California")) and (wanted_gaccs is None or (gacc_val and gacc_val.upper() in wanted_gaccs)):
             filtered.append(f)
 
-    return {"features": filtered}
+    if not filtered:
+        # If we filtered out everything, return the whole set so caller can inspect
+        return {"type": "FeatureCollection", "features": feats}
+
+    return {"type": "FeatureCollection", "features": filtered}
 
 # ============================================================
 # ROUTES
@@ -170,13 +208,13 @@ async def health():
 
 @app.get("/psas")
 async def psas(gacc: Optional[str] = Query(None, description="Comma-delimited GACCs (e.g., 'ONCC,OSCC'). Default: both.")):
-    """Return filtered CA PSAs (Esri JSON)."""
+    """Return CA PSAs (GeoJSON)."""
     return await fetch_ca_psas(gacc=gacc)
 
 @app.get("/ca_psa_herbaceous")
 async def ca_psa_herbaceous(
     year: Optional[int] = Query(None, description="Optional RAP year filter."),
-    intervals: int = Query(3, ge=1, le=12, description="Number of most-recent 16-day intervals to include."),
+    intervals: int = Query(3, ge=1, le=12, description="Number of most-recent 16-day intervals."),
     gacc: Optional[str] = Query(None, description="Comma-delimited GACCs (default ONCC,OSCC)."),
     include_series: bool = Query(True, description="If false, only latest values are returned."),
 ):
@@ -191,24 +229,26 @@ async def ca_psa_herbaceous(
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async def worker(f: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        attrs = f.get("attributes", {}) or {}
-        esri_geom = f.get("geometry", {}) or {}
-        if "rings" not in esri_geom:
+        props = f.get("properties", {}) or {}
+        geom = f.get("geometry", {}) or {}
+        if geom.get("type") not in ("Polygon", "MultiPolygon"):
             return None
-        try:
-            geojson_poly = _esri_polygon_to_geojson(esri_geom)
-        except Exception:
-            return None
+        # For MultiPolygon, use the first polygon shell
+        if geom["type"] == "MultiPolygon":
+            coords = geom.get("coordinates") or []
+            if not coords:
+                return None
+            geom = {"type": "Polygon", "coordinates": coords[0]}
 
         async with sem:
-            rap_json = await _rap_for_polygon(geojson_poly, year)
+            rap_json = await _rap_for_polygon(geom, year)
         series = _last_n(rap_json.get("production16day", []), intervals)
 
         rec = {
-            "PSA_ID":   attrs.get("PSA_ID") or attrs.get("PSAID"),
-            "PSA_NAME": attrs.get("PSA_NAME") or attrs.get("PSANAME"),
-            "GACC":     attrs.get("GACC"),
-            "STATE":    attrs.get("STATE"),
+            "PSA_ID":   props.get("PSA_ID") or props.get("PSAID"),
+            "PSA_NAME": props.get("PSA_NAME") or props.get("PSANAME"),
+            "GACC":     props.get("GACC") or props.get("gacc"),
+            "STATE":    props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State"),
         }
 
         latest = series[-1] if series else None
@@ -226,7 +266,7 @@ async def ca_psa_herbaceous(
                     rec[f"PFG_lbsac_{d}"] = row.get("PFG")
                     rec[f"HER_lbsac_{d}"] = row.get("HER")
 
-        return {"type": "Feature", "geometry": geojson_poly, "properties": rec}
+        return {"type": "Feature", "geometry": geom, "properties": rec}
 
     results = await asyncio.gather(*(worker(f) for f in feats))
     out_features = [r for r in results if r]
