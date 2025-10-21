@@ -90,6 +90,72 @@ last_exc = e
 await asyncio.sleep((RETRY_BACKOFF_BASE ** (attempt - 1)))
 raise HTTPException(status_code=502, detail=f"POST failed for {url}: {last_exc}")
 
+# ---------- PL scoring helpers ----------
+def _pl_points_from_count(affected_count: int) -> int:
+"""
+South Ops scale:
+0–1 = 2 pts
+2–4 = 4 pts
+5–7 = 6 pts
+8–10 = 8 pts
+11+ = 10 pts
+"""
+if affected_count <= 1:
+return 2
+if affected_count <= 4:
+return 4
+if affected_count <= 7:
+return 6
+if affected_count <= 10:
+return 8
+return 10
+
+@app.get("/southops_pl_points")
+async def southops_pl_points(
+threshold_lbsac: float,
+intervals: int = Query(1, ge=1, le=12, description="How many most-recent 16-day intervals to fetch (we evaluate the latest)."),
+metric: str = Query("HER", pattern="^(HER|AFG|PFG)$", description="Which RAP field to test against threshold: HER, AFG, or PFG."),
+gacc: str = Query("OSCC", description="Which GACC(s) to evaluate. Default OSCC (South Ops). Use 'ONCC' or 'ONCC,OSCC' if desired."),
+):
+"""
+Count PSAs in the chosen GACC(s) where <metric>_latest >= threshold_lbsac,
+then map that count to PL points using South Ops scale.
+"""
+# Reuse the logic that builds PSA features with latest metrics (fast + cached)
+fc = await ca_psa_herbaceous(year=None, intervals=intervals, gacc=gacc, include_series=False)
+feats = fc.get("features", [])
+total_psas = len(feats)
+
+affected = []
+latest_date = None
+
+for f in feats:
+props = f["properties"]
+latest_date = latest_date or props.get("IntervalDate_latest")
+val = props.get(f"{metric}_latest")
+if val is not None and float(val) >= float(threshold_lbsac):
+affected.append({
+"PSA_ID": props.get("PSA_ID"),
+"PSA_NAME": props.get("PSA_NAME"),
+"GACC": props.get("GACC"),
+f"{metric}_latest": val
+})
+
+affected_count = len(affected)
+points = _pl_points_from_count(affected_count)
+
+return {
+"gacc": gacc,
+"metric": metric,
+"threshold_lbsac": threshold_lbsac,
+"total_psas": total_psas,
+"affected_count": affected_count,
+"points": points,
+"scale": {"0-1": 2, "2-4": 4, "5-7": 6, "8-10": 8, "11+": 10},
+"as_of_interval_date": latest_date,
+"affected_psas": affected # handy for QA or popup drilldown
+}
+
 # ----------------------------
 # ArcGIS FeatureService helpers
 # ----------------------------
@@ -237,4 +303,5 @@ out_features = [r for r in results if r]
 
 out = {"type": "FeatureCollection", "features": out_features}
 cache_set(cache_key, out)
+
 return out
