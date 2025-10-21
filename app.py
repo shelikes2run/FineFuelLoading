@@ -10,17 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 # CONFIG
 # ============================================================
-# Your GeoJSON PSA service (works in your environment)
 NIFC_PSA_GEOJSON = os.getenv(
     "NIFC_PSA_GEOJSON",
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer/0/query"
-)
-# Legacy (Esri JSON) — only used as a fallback if needed
-NIFC_PSA_ESRIJSON = os.getenv(
-    "NIFC_PSA_ESRIJSON",
-    "https://services1.arcgis.com/99lidPhWCzftIe9K/ArcGIS/rest/services/"
-    "Predictive_Service_Area_PSA_Boundaries_Public/FeatureServer/0/query"
 )
 
 RAP_URL = os.getenv(
@@ -28,16 +21,17 @@ RAP_URL = os.getenv(
     "https://us-central1-rap-data-365417.cloudfunctions.net/production16dayV3",
 )
 
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "8"))
-HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "120"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "90"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
 RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "1.7"))
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "21600"))  # 6 hours
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "3600"))
+MAX_CACHE_ENTRIES = int(os.getenv("MAX_CACHE_ENTRIES", "8"))
 
 # ============================================================
 # APP SETUP
 # ============================================================
-app = FastAPI(title="CA PSA Herbaceous API", version="3.0.0")
+app = FastAPI(title="CA PSA Herbaceous API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,7 +42,7 @@ app.add_middleware(
 )
 
 # ============================================================
-# SIMPLE IN-MEMORY CACHE
+# CACHE
 # ============================================================
 _cache: Dict[str, Tuple[float, Any]] = {}  # key -> (expires_at, value)
 
@@ -64,167 +58,156 @@ def cache_get(key: str):
     return val
 
 def cache_set(key: str, val: Any, ttl: int = CACHE_TTL_SEC):
+    if len(_cache) >= MAX_CACHE_ENTRIES:
+        oldest = min(_cache, key=lambda k: _cache[k][0])
+        _cache.pop(oldest, None)
     _cache[key] = (time.time() + ttl, val)
 
 # ============================================================
-# HTTP HELPERS
+# GLOBAL HTTP CLIENT
 # ============================================================
+_client: Optional[httpx.AsyncClient] = None
+
+@app.on_event("startup")
+async def _startup():
+    global _client
+    _client = httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC)
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global _client
+    if _client:
+        await _client.aclose()
+
+# ============================================================
+# HELPERS
+# ============================================================
+def _thin_polygon(geom: Dict[str, Any], max_points: int = 3000) -> Dict[str, Any]:
+    """Reduce vertex count to avoid huge AOIs."""
+    if not geom or "type" not in geom:
+        return geom
+
+    def _thin_ring(ring: List[List[float]], max_pts: int) -> List[List[float]]:
+        if len(ring) <= max_pts:
+            return ring
+        step = max(1, len(ring) // max_pts)
+        out = ring[::step]
+        if out[0] != out[-1]:
+            out.append(out[0])
+        return out
+
+    if geom["type"] == "Polygon":
+        coords = geom.get("coordinates", [])
+        if not coords:
+            return geom
+        shell = _thin_ring(coords[0], max_points)
+        holes = [_thin_ring(r, max_points // 5) for r in coords[1:]]
+        return {"type": "Polygon", "coordinates": [shell] + holes}
+
+    if geom["type"] == "MultiPolygon":
+        polys = []
+        for poly in geom.get("coordinates", []):
+            if not poly:
+                continue
+            shell = _thin_ring(poly[0], max_points)
+            holes = [_thin_ring(r, max_points // 5) for r in poly[1:]]
+            polys.append([shell] + holes)
+        if not polys:
+            return {"type": "Polygon", "coordinates": []}
+        return {"type": "Polygon", "coordinates": polys[0]}
+
+    return geom
+
 async def _http_get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    global _client
     last_exc = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                return r.json()
+            r = await _client.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
         except Exception as e:
             last_exc = e
             await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt - 1))
     raise HTTPException(status_code=502, detail=f"GET failed for {url}: {last_exc}")
 
 async def _http_post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    global _client
     last_exc = None
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SEC) as client:
-                r = await client.post(url, json=payload)
-                r.raise_for_status()
-                return r.json()
+            r = await _client.post(url, json=payload)
+            r.raise_for_status()
+            return r.json()
         except Exception as e:
             last_exc = e
             await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt - 1))
     raise HTTPException(status_code=502, detail=f"POST failed for {url}: {last_exc}")
 
-# ============================================================
-# HELPERS
-# ============================================================
 def _last_n(rows: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    if not rows:
-        return []
-    return rows[-n:] if n and n < len(rows) else rows
+    return rows[-n:] if rows and n < len(rows) else rows
 
 async def _rap_for_polygon(geojson_polygon: Dict[str, Any], year: Optional[int]) -> Dict[str, Any]:
     payload = {"aoi": geojson_polygon}
     if year:
         payload["year"] = int(year)
-    return await _http_post_json(RAP_URL, payload)
-
-# ============================================================
-# PSA FETCHERS
-# ============================================================
-async def fetch_psas_geojson() -> Dict[str, Any]:
-    """
-    Preferred: fetch PSA features as GeoJSON from your working service.
-    """
-    params = {
-        "where": "1=1",
-        "outFields": "*",
-        "f": "geojson",
-        "returnGeometry": "true",
-        "outSR": 4326
-    }
-    data = await _http_get_json(NIFC_PSA_GEOJSON, params)
-    # GeoJSON always has 'features' list
-    feats = data.get("features")
-    if not isinstance(feats, list) or not feats:
-        raise HTTPException(status_code=502, detail="PSA GeoJSON: no features returned")
-    return data
-
-async def fetch_psas_esrijson() -> Dict[str, Any]:
-    """
-    Fallback: fetch PSA as Esri JSON, return a GeoJSON-like dict.
-    (Converts Esri polygons to GeoJSON Polygons.)
-    """
-    params = {
-        "where": "1=1",
-        "outFields": "*",
-        "f": "json",
-        "returnGeometry": "true",
-        "outSR": 4326,
-        "resultRecordCount": 5000
-    }
-    data = await _http_get_json(NIFC_PSA_ESRIJSON, params)
-    if "features" not in data or not data["features"]:
-        raise HTTPException(status_code=502, detail="PSA EsriJSON: no features returned")
-
-    def esri_to_geojson(poly_esri):
-        rings = poly_esri.get("rings") or []
-        if not rings:
-            return None
-        def close_ring(coords):
-            return coords if coords[0] == coords[-1] else coords + [coords[0]]
-        shell = close_ring([[x, y] for x, y in rings[0]])
-        holes = [close_ring([[x, y] for x, y in r]) for r in rings[1:]]
-        return {"type": "Polygon", "coordinates": [shell] + holes}
-
-    out_feats = []
-    for f in data["features"]:
-        attrs = f.get("attributes", {})
-        geom = f.get("geometry", {})
-        if "rings" not in geom:
-            continue
-        gj = esri_to_geojson(geom)
-        if not gj:
-            continue
-        out_feats.append({"type": "Feature", "geometry": gj, "properties": attrs})
-
-    if not out_feats:
-        raise HTTPException(status_code=502, detail="PSA EsriJSON: conversion produced no features")
-    return {"type": "FeatureCollection", "features": out_feats}
-
-async def fetch_ca_psas(gacc: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Try GeoJSON source first; if it fails, use EsriJSON fallback.
-    Then filter client-side to CA + requested GACC(s).
-    """
     try:
-        fc = await fetch_psas_geojson()
-    except Exception:
-        fc = await fetch_psas_esrijson()  # fallback
-
-    feats = fc.get("features", [])
-    wanted_gaccs = {x.strip().upper() for x in gacc.split(",")} if gacc else None
-
-    filtered = []
-    for f in feats:
-        props = f.get("properties", {}) or {}
-        state_val = props.get("STATE") or props.get("ST") or props.get("State") or props.get("STATE_NAME")
-        gacc_val  = props.get("GACC") or props.get("gacc")
-        if (state_val in ("CA", "California")) and (wanted_gaccs is None or (gacc_val and gacc_val.upper() in wanted_gaccs)):
-            filtered.append(f)
-
-    if not filtered:
-        # If we filtered out everything, return the whole set so caller can inspect
-        return {"type": "FeatureCollection", "features": feats}
-
-    return {"type": "FeatureCollection", "features": filtered}
+        return await _http_post_json(RAP_URL, payload)
+    except Exception as e:
+        print(f"[WARN] RAP call failed: {e}")
+        return {}
 
 # ============================================================
 # ROUTES
 # ============================================================
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "Fine Fuel Loading API", "version": app.version}
+
 @app.get("/health")
 async def health():
     return {"ok": True, "ts": int(time.time())}
 
 @app.get("/psas")
-async def psas(gacc: Optional[str] = Query(None, description="Comma-delimited GACCs (e.g., 'ONCC,OSCC'). Default: both.")):
-    """Return CA PSAs (GeoJSON)."""
-    return await fetch_ca_psas(gacc=gacc)
+async def psas(gacc: Optional[str] = Query(None)):
+    """Return CA PSAs."""
+    params = {
+        "where": "1=1",
+        "outFields": "*",
+        "f": "geojson",
+        "returnGeometry": "true",
+        "outSR": 4326,
+    }
+    data = await _http_get_json(NIFC_PSA_GEOJSON, params)
+    feats = data.get("features", [])
+    if not feats:
+        raise HTTPException(status_code=502, detail="No PSA features returned")
+    wanted_gaccs = {x.strip().upper() for x in gacc.split(",")} if gacc else None
+    filtered = []
+    for f in feats:
+        props = f.get("properties", {})
+        state_val = props.get("STATE") or props.get("ST") or props.get("State") or props.get("STATE_NAME")
+        gacc_val = props.get("GACC") or props.get("gacc")
+        if (state_val in ("CA", "California")) and (
+            not wanted_gaccs or (gacc_val and gacc_val.upper() in wanted_gaccs)
+        ):
+            filtered.append(f)
+    return {"type": "FeatureCollection", "features": filtered or feats}
 
 @app.get("/ca_psa_herbaceous")
 async def ca_psa_herbaceous(
-    year: Optional[int] = Query(None, description="Optional RAP year filter."),
-    intervals: int = Query(3, ge=1, le=12, description="Number of most-recent 16-day intervals."),
-    gacc: Optional[str] = Query(None, description="Comma-delimited GACCs (default ONCC,OSCC)."),
-    include_series: bool = Query(True, description="If false, only latest values are returned."),
+    year: Optional[int] = Query(None),
+    intervals: int = Query(1, ge=1, le=12),
+    gacc: Optional[str] = Query(None),
+    include_series: bool = Query(False),
 ):
-    """Return RAP herbaceous production (AFG/PFG/HER, lbs/ac) by CA PSA as GeoJSON."""
+    """Return RAP herbaceous production by PSA."""
     cache_key = f"psa:{gacc}|year:{year}|int:{intervals}|series:{include_series}"
     cached = cache_get(cache_key)
     if cached:
         return cached
 
-    psa_fc = await fetch_ca_psas(gacc=gacc)
+    psa_fc = await psas(gacc)
     feats = psa_fc["features"]
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -233,24 +216,18 @@ async def ca_psa_herbaceous(
         geom = f.get("geometry", {}) or {}
         if geom.get("type") not in ("Polygon", "MultiPolygon"):
             return None
-        # For MultiPolygon, use the first polygon shell
-        if geom["type"] == "MultiPolygon":
-            coords = geom.get("coordinates") or []
-            if not coords:
-                return None
-            geom = {"type": "Polygon", "coordinates": coords[0]}
+        geom = _thin_polygon(geom, 2000)
 
         async with sem:
             rap_json = await _rap_for_polygon(geom, year)
+
         series = _last_n(rap_json.get("production16day", []), intervals)
-
         rec = {
-            "PSA_ID":   props.get("PSA_ID") or props.get("PSAID"),
+            "PSA_ID": props.get("PSA_ID") or props.get("PSAID"),
             "PSA_NAME": props.get("PSA_NAME") or props.get("PSANAME"),
-            "GACC":     props.get("GACC") or props.get("gacc"),
-            "STATE":    props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State"),
+            "GACC": props.get("GACC") or props.get("gacc"),
+            "STATE": props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State"),
         }
-
         latest = series[-1] if series else None
         if latest:
             rec["AFG_latest"] = latest.get("AFG")
@@ -274,9 +251,6 @@ async def ca_psa_herbaceous(
     cache_set(cache_key, out)
     return out
 
-# ============================================================
-# SOUTH OPS PL POINTS ENDPOINT
-# ============================================================
 def _pl_points_from_count(affected_count: int) -> int:
     """South Ops scale mapping."""
     if affected_count <= 1:
@@ -292,14 +266,11 @@ def _pl_points_from_count(affected_count: int) -> int:
 @app.get("/southops_pl_points")
 async def southops_pl_points(
     threshold_lbsac: float,
-    intervals: int = Query(1, ge=1, le=12, description="How many intervals to fetch (use latest interval for scoring)."),
-    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$", description="Metric to test (HER, AFG, or PFG)."),
-    gacc: str = Query("OSCC", description="Which GACC(s) to evaluate; default OSCC (South Ops)."),
+    intervals: int = Query(1, ge=1, le=12),
+    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
+    gacc: str = Query("OSCC"),
 ):
-    """
-    Count PSAs in chosen GACC(s) with <metric>_latest >= threshold_lbsac,
-    then return PL points using South Ops scale.
-    """
+    """Count PSAs above threshold and return PL points."""
     fc = await ca_psa_herbaceous(year=None, intervals=intervals, gacc=gacc, include_series=False)
     feats = fc.get("features", [])
     total_psas = len(feats)
