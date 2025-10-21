@@ -21,6 +21,7 @@ RAP_URL = os.getenv(
     "https://us-central1-rap-data-365417.cloudfunctions.net/production16dayV3",
 )
 
+# Runtime knobs (tuned for small instances / low RAM)
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
 HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "90"))
 RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
@@ -31,7 +32,7 @@ MAX_CACHE_ENTRIES = int(os.getenv("MAX_CACHE_ENTRIES", "8"))
 # ============================================================
 # APP SETUP
 # ============================================================
-app = FastAPI(title="CA PSA Herbaceous API", version="3.1.0")
+app = FastAPI(title="CA PSA Herbaceous API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,7 +43,7 @@ app.add_middleware(
 )
 
 # ============================================================
-# CACHE
+# CACHE (simple, capped)
 # ============================================================
 _cache: Dict[str, Tuple[float, Any]] = {}  # key -> (expires_at, value)
 
@@ -82,8 +83,8 @@ async def _shutdown():
 # ============================================================
 # HELPERS
 # ============================================================
-def _thin_polygon(geom: Dict[str, Any], max_points: int = 3000) -> Dict[str, Any]:
-    """Reduce vertex count to avoid huge AOIs."""
+def _thin_polygon(geom: Dict[str, Any], max_points: int = 2000) -> Dict[str, Any]:
+    """Downsample polygon rings to keep AOIs lightweight (no extra deps)."""
     if not geom or "type" not in geom:
         return geom
 
@@ -114,6 +115,7 @@ def _thin_polygon(geom: Dict[str, Any], max_points: int = 3000) -> Dict[str, Any
             polys.append([shell] + holes)
         if not polys:
             return {"type": "Polygon", "coordinates": []}
+        # RAP accepts one AOI; use the first poly
         return {"type": "Polygon", "coordinates": polys[0]}
 
     return geom
@@ -154,23 +156,27 @@ async def _rap_for_polygon(geojson_polygon: Dict[str, Any], year: Optional[int])
     try:
         return await _http_post_json(RAP_URL, payload)
     except Exception as e:
+        # Donâ€™t crash the whole request if RAP blips
         print(f"[WARN] RAP call failed: {e}")
         return {}
 
 # ============================================================
-# ROUTES
+# ROUTES: basic
 # ============================================================
 @app.get("/")
 async def root():
-    return {"ok": True, "service": "Fine Fuel Loading API", "version": app.version}
+    return {"ok": True, "service": "CA PSA Herbaceous API", "version": app.version}
 
 @app.get("/health")
 async def health():
     return {"ok": True, "ts": int(time.time())}
 
+# ============================================================
+# ROUTES: PSAs & herbaceous metrics
+# ============================================================
 @app.get("/psas")
-async def psas(gacc: Optional[str] = Query(None)):
-    """Return CA PSAs."""
+async def psas(gacc: Optional[str] = Query(None, description="OSCC, ONCC, or both comma-separated")):
+    """Return CA PSA polygons (GeoJSON FeatureCollection)."""
     params = {
         "where": "1=1",
         "outFields": "*",
@@ -182,16 +188,16 @@ async def psas(gacc: Optional[str] = Query(None)):
     feats = data.get("features", [])
     if not feats:
         raise HTTPException(status_code=502, detail="No PSA features returned")
-    wanted_gaccs = {x.strip().upper() for x in gacc.split(",")} if gacc else None
+
+    wanted = {x.strip().upper() for x in gacc.split(",")} if gacc else None
     filtered = []
     for f in feats:
         props = f.get("properties", {})
         state_val = props.get("STATE") or props.get("ST") or props.get("State") or props.get("STATE_NAME")
         gacc_val = props.get("GACC") or props.get("gacc")
-        if (state_val in ("CA", "California")) and (
-            not wanted_gaccs or (gacc_val and gacc_val.upper() in wanted_gaccs)
-        ):
+        if (state_val in ("CA", "California")) and (not wanted or (gacc_val and gacc_val.upper() in wanted)):
             filtered.append(f)
+
     return {"type": "FeatureCollection", "features": filtered or feats}
 
 @app.get("/ca_psa_herbaceous")
@@ -201,7 +207,7 @@ async def ca_psa_herbaceous(
     gacc: Optional[str] = Query(None),
     include_series: bool = Query(False),
 ):
-    """Return RAP herbaceous production by PSA."""
+    """Return RAP herbaceous production (AFG/PFG/HER, lbs/ac) by PSA."""
     cache_key = f"psa:{gacc}|year:{year}|int:{intervals}|series:{include_series}"
     cached = cache_get(cache_key)
     if cached:
@@ -223,10 +229,10 @@ async def ca_psa_herbaceous(
 
         series = _last_n(rap_json.get("production16day", []), intervals)
         rec = {
-            "PSA_ID": props.get("PSA_ID") or props.get("PSAID"),
+            "PSA_ID":   props.get("PSA_ID") or props.get("PSAID"),
             "PSA_NAME": props.get("PSA_NAME") or props.get("PSANAME"),
-            "GACC": props.get("GACC") or props.get("gacc"),
-            "STATE": props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State"),
+            "GACC":     props.get("GACC") or props.get("gacc"),
+            "STATE":    props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State"),
         }
         latest = series[-1] if series else None
         if latest:
@@ -251,8 +257,14 @@ async def ca_psa_herbaceous(
     cache_set(cache_key, out)
     return out
 
+# ============================================================
+# ROUTES: PL points (South Ops, North Ops, or both)
+# ============================================================
 def _pl_points_from_count(affected_count: int) -> int:
-    """South Ops scale mapping."""
+    """
+    South Ops scale (default):
+      0â€“1 => 2 pts, 2â€“4 => 4 pts, 5â€“7 => 6 pts, 8â€“10 => 8 pts, 11+ => 10 pts
+    """
     if affected_count <= 1:
         return 2
     if affected_count <= 4:
@@ -263,19 +275,12 @@ def _pl_points_from_count(affected_count: int) -> int:
         return 8
     return 10
 
-@app.get("/southops_pl_points")
-async def southops_pl_points(
-    threshold_lbsac: float,
-    intervals: int = Query(1, ge=1, le=12),
-    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
-    gacc: str = Query("OSCC"),
-):
-    """Count PSAs above threshold and return PL points."""
-    fc = await ca_psa_herbaceous(year=None, intervals=intervals, gacc=gacc, include_series=False)
+async def _count_and_points_for_gacc(gacc_code: str, threshold_lbsac: float, metric: str, intervals: int) -> dict:
+    """Compute affected count and PL points for a single GACC."""
+    fc = await ca_psa_herbaceous(year=None, intervals=intervals, gacc=gacc_code, include_series=False)
     feats = fc.get("features", [])
-    total_psas = len(feats)
-    affected = []
     latest_date = None
+    affected = []
 
     for f in feats:
         props = f["properties"]
@@ -290,16 +295,73 @@ async def southops_pl_points(
             })
 
     affected_count = len(affected)
-    points = _pl_points_from_count(affected_count)
-
     return {
-        "gacc": gacc,
-        "metric": metric,
-        "threshold_lbsac": threshold_lbsac,
-        "total_psas": total_psas,
+        "gacc": gacc_code,
+        "total_psas": len(feats),
         "affected_count": affected_count,
-        "points": points,
-        "scale": {"0-1": 2, "2-4": 4, "5-7": 6, "8-10": 8, "11+": 10},
+        "points": _pl_points_from_count(affected_count),
         "as_of_interval_date": latest_date,
         "affected_psas": affected,
     }
+
+@app.get("/pl_finefuel_points")
+async def pl_finefuel_points(
+    threshold_lbsac: float,
+    intervals: int = Query(1, ge=1, le=12, description="Latest interval is used for scoring."),
+    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
+    gacc: str = Query("OSCC", description="OSCC, ONCC, or ONCC,OSCC"),
+):
+    """
+    Points for OSCC (South Ops), ONCC (North Ops), or both (comma-separated).
+    Returns per-GACC breakdown and overall counts. If both GACCs requested,
+    'overall.points' is None (since scales may differ).
+    """
+    gaccs = [x.strip().upper() for x in gacc.split(",") if x.strip()]
+    gaccs = [x for x in dict.fromkeys(gaccs) if x in ("OSCC", "ONCC")]
+    if not gaccs:
+        gaccs = ["OSCC"]
+
+    breakdown = []
+    latest = None
+    total_psas = 0
+    total_affected = 0
+
+    for g in gaccs:
+        res = await _count_and_points_for_gacc(g, threshold_lbsac, metric, intervals)
+        breakdown.append(res)
+        latest = latest or res["as_of_interval_date"]
+        total_psas += res["total_psas"]
+        total_affected += res["affected_count"]
+
+    overall_points = _pl_points_from_count(total_affected) if len(gaccs) == 1 else None
+
+    return {
+        "metric": metric,
+        "threshold_lbsac": threshold_lbsac,
+        "requested_gaccs": gaccs,
+        "as_of_interval_date": latest,
+        "overall": {
+            "total_psas": total_psas,
+            "affected_count": total_affected,
+            "points": overall_points
+        },
+        "breakdown": breakdown,
+        "scale_note": "South Ops bucket scale in use; provide North Ops scale if different."
+    }
+
+# Convenience aliases
+@app.get("/southops_pl_points")
+async def southops_pl_points(
+    threshold_lbsac: float,
+    intervals: int = Query(1, ge=1, le=12),
+    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
+):
+    return await pl_finefuel_points(threshold_lbsac=threshold_lbsac, intervals=intervals, metric=metric, gacc="OSCC")
+
+@app.get("/northops_pl_points")
+async def northops_pl_points(
+    threshold_lbsac: float,
+    intervals: int = Query(1, ge=1, le=12),
+    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
+):
+    return await pl_finefuel_points(threshold_lbsac=threshold_lbsac, intervals=intervals, metric=metric, gacc="ONCC")
