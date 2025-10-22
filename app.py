@@ -1,38 +1,38 @@
 import os
 import time
+import json as _json
 import asyncio
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
 NIFC_PSA_GEOJSON = os.getenv(
     "NIFC_PSA_GEOJSON",
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer/0/query"
 )
 
-RAP_URL = os.getenv(
-    "RAP_URL",
-    "https://us-central1-rap-data-365417.cloudfunctions.net/production16dayV3",
+# RAP 10m vegetation cover (annual), community catalog
+EE_COLLECTION_10M = os.getenv(
+    "EE_COLLECTION_10M",
+    "projects/rap-data-365417/assets/vegetation-cover-10m"
 )
 
-# Runtime knobs (tuned for small instances / low RAM)
-MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "2"))
-HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "90"))
-RETRY_ATTEMPTS = int(os.getenv("RETRY_ATTEMPTS", "3"))
-RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "1.7"))
+# Runtime knobs (keep memory tiny on Render Starter)
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
+HTTP_TIMEOUT_SEC = float(os.getenv("HTTP_TIMEOUT_SEC", "60"))
 CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "3600"))
-MAX_CACHE_ENTRIES = int(os.getenv("MAX_CACHE_ENTRIES", "8"))
+MAX_CACHE_ENTRIES = int(os.getenv("MAX_CACHE_ENTRIES", "6"))
 
-# ============================================================
-# APP SETUP
-# ============================================================
-app = FastAPI(title="CA PSA Herbaceous API", version="3.3.0")
+# ---------------------------------------------------------------------
+# FastAPI app + CORS
+# ---------------------------------------------------------------------
+app = FastAPI(title="CA PSA Herbaceous API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,18 +42,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============================================================
-# CACHE (simple, capped)
-# ============================================================
-_cache: Dict[str, Tuple[float, Any]] = {}  # key -> (expires_at, value)
+# ---------------------------------------------------------------------
+# Simple capped in-memory cache
+# ---------------------------------------------------------------------
+_cache: Dict[str, Tuple[float, Any]] = {}
 
 def cache_get(key: str):
-    now = time.time()
-    hit = _cache.get(key)
-    if not hit:
+    rec = _cache.get(key)
+    if not rec:
         return None
-    exp, val = hit
-    if now > exp:
+    exp, val = rec
+    if time.time() > exp:
         _cache.pop(key, None)
         return None
     return val
@@ -64,9 +63,9 @@ def cache_set(key: str, val: Any, ttl: int = CACHE_TTL_SEC):
         _cache.pop(oldest, None)
     _cache[key] = (time.time() + ttl, val)
 
-# ============================================================
-# GLOBAL HTTP CLIENT
-# ============================================================
+# ---------------------------------------------------------------------
+# Single shared HTTP client
+# ---------------------------------------------------------------------
 _client: Optional[httpx.AsyncClient] = None
 
 @app.on_event("startup")
@@ -80,11 +79,24 @@ async def _shutdown():
     if _client:
         await _client.aclose()
 
-# ============================================================
-# HELPERS
-# ============================================================
+async def _http_get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = await _client.get(url, params=params)
+    r.raise_for_status()
+    return r.json()
+
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
+def _pl_points_from_count(affected_count: int) -> int:
+    """SouthOps PL scale based on # of PSAs affected."""
+    if affected_count <= 1: return 2
+    if affected_count <= 4: return 4
+    if affected_count <= 7: return 6
+    if affected_count <= 10: return 8
+    return 10
+
 def _thin_polygon(geom: Dict[str, Any], max_points: int = 2000) -> Dict[str, Any]:
-    """Downsample polygon rings to keep AOIs lightweight (no extra deps)."""
+    """Downsample polygon rings to keep AOIs lightweight."""
     if not geom or "type" not in geom:
         return geom
 
@@ -97,7 +109,8 @@ def _thin_polygon(geom: Dict[str, Any], max_points: int = 2000) -> Dict[str, Any
             out.append(out[0])
         return out
 
-    if geom["type"] == "Polygon":
+    t = geom.get("type")
+    if t == "Polygon":
         coords = geom.get("coordinates", [])
         if not coords:
             return geom
@@ -105,7 +118,7 @@ def _thin_polygon(geom: Dict[str, Any], max_points: int = 2000) -> Dict[str, Any
         holes = [_thin_ring(r, max_points // 5) for r in coords[1:]]
         return {"type": "Polygon", "coordinates": [shell] + holes}
 
-    if geom["type"] == "MultiPolygon":
+    if t == "MultiPolygon":
         polys = []
         for poly in geom.get("coordinates", []):
             if not poly:
@@ -115,54 +128,128 @@ def _thin_polygon(geom: Dict[str, Any], max_points: int = 2000) -> Dict[str, Any
             polys.append([shell] + holes)
         if not polys:
             return {"type": "Polygon", "coordinates": []}
-        # RAP accepts one AOI; use the first poly
+        # collapse to first polygon to keep payload small
         return {"type": "Polygon", "coordinates": polys[0]}
 
     return geom
 
-async def _http_get_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    global _client
-    last_exc = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            r = await _client.get(url, params=params)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt - 1))
-    raise HTTPException(status_code=502, detail=f"GET failed for {url}: {last_exc}")
+# ---------------------------------------------------------------------
+# Google Earth Engine init
+# ---------------------------------------------------------------------
+EE_SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT")       # <svc>@<project>.iam.gserviceaccount.com
+EE_PRIVATE_KEY_JSON = os.getenv("EE_PRIVATE_KEY_JSON")     # Full JSON key (string)
 
-async def _http_post_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    global _client
-    last_exc = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            r = await _client.post(url, json=payload)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_exc = e
-            await asyncio.sleep(RETRY_BACKOFF_BASE ** (attempt - 1))
-    raise HTTPException(status_code=502, detail=f"POST failed for {url}: {last_exc}")
+_ee_initialized = False
 
-def _last_n(rows: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
-    return rows[-n:] if rows and n < len(rows) else rows
-
-async def _rap_for_polygon(geojson_polygon: Dict[str, Any], year: Optional[int]) -> Dict[str, Any]:
-    payload = {"aoi": geojson_polygon}
-    if year:
-        payload["year"] = int(year)
+def _gee_init():
+    """Initialize Earth Engine once per process (service account preferred)."""
+    global _ee_initialized
+    if _ee_initialized:
+        return
     try:
-        return await _http_post_json(RAP_URL, payload)
+        import ee
+        if EE_SERVICE_ACCOUNT and EE_PRIVATE_KEY_JSON:
+            creds = ee.ServiceAccountCredentials(
+                EE_SERVICE_ACCOUNT, key_data=_json.loads(EE_PRIVATE_KEY_JSON)
+            )
+            ee.Initialize(creds)
+        else:
+            ee.Initialize()  # local dev fallback
+        _ee_initialized = True
+        print("[GEE] Initialized")
     except Exception as e:
-        # Donâ€™t crash the whole request if RAP blips
-        print(f"[WARN] RAP call failed: {e}")
-        return {}
+        print("[GEE] Init failed:", e)
+        raise HTTPException(status_code=500, detail=f"GEE init failed: {e}")
 
-# ============================================================
-# ROUTES: basic
-# ============================================================
+def _geojson_to_ee_geometry(geom: Dict[str, Any]):
+    import ee
+    gtype = geom.get("type")
+    coords = geom.get("coordinates")
+    if not gtype or coords is None:
+        raise HTTPException(400, "Invalid geometry")
+    if gtype == "Polygon":
+        return ee.Geometry.Polygon(coords, None, False)
+    if gtype == "MultiPolygon":
+        return ee.Geometry.MultiPolygon(coords, None, False)
+    raise HTTPException(400, f"Unsupported geometry type: {gtype}")
+
+# ---------------------------------------------------------------------
+# Core: current vs. normal (2018â€“2023) for RAP 10m AFG+PFG
+# ---------------------------------------------------------------------
+async def _gee_latest_stats_for_geom(geom: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Compute mean Annual & Perennial Forb/Grass cover (%) for AOI using RAP 10 m.
+    Returns latest-year value + 2018â€“2023 normal + % difference and AboveNormal flag.
+    """
+    def _work():
+        import ee
+        _gee_init()
+
+        ic = ee.ImageCollection(EE_COLLECTION_10M)
+        ee_geom = _geojson_to_ee_geometry(geom)
+
+        # Historical normal across 2018â€“2023 inclusive
+        hist_ic = ic.filterDate("2018-01-01", "2024-01-01")
+        latest = ic.sort("system:time_start", False).first()
+
+        if latest is None:
+            return None
+
+        # Bands of interest
+        bands = ["AnnualForbGrass", "PerennialForbGrass"]
+
+        # Normal (2018â€“2023) mean within AOI
+        hist_mean = hist_ic.select(bands).mean().reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=ee_geom,
+            scale=10,
+            maxPixels=1e9,
+            bestEffort=True
+        )
+
+        # Latest year mean within AOI
+        latest_stats = latest.select(bands).reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=ee_geom,
+            scale=10,
+            maxPixels=1e9,
+            bestEffort=True
+        )
+
+        hist = hist_mean.getInfo() or {}
+        curr = latest_stats.getInfo() or {}
+        year_str = ee.Date(latest.get("system:time_start")).format("YYYY").getInfo()
+
+        afg = curr.get("AnnualForbGrass")
+        pfg = curr.get("PerennialForbGrass")
+        afg_norm = hist.get("AnnualForbGrass")
+        pfg_norm = hist.get("PerennialForbGrass")
+
+        curr_total = (afg or 0.0) + (pfg or 0.0)
+        norm_total = (afg_norm or 0.0) + (pfg_norm or 0.0)
+
+        pct_diff = None
+        if norm_total:
+            pct_diff = 100.0 * (curr_total - norm_total) / norm_total
+
+        return {
+            "year": year_str,
+            "AFG": afg,
+            "PFG": pfg,
+            "AFG_norm": afg_norm,
+            "PFG_norm": pfg_norm,
+            "Total_current": curr_total,
+            "Total_normal": norm_total,
+            "PctDiff": pct_diff,
+            "AboveNormal": (pct_diff is not None and pct_diff > 0.0)
+        }
+
+    return await asyncio.to_thread(_work)
+
+# ---------------------------------------------------------------------
+# Routes: basic / health
+# ---------------------------------------------------------------------
+@app.head("/")
 @app.get("/")
 async def root():
     return {"ok": True, "service": "CA PSA Herbaceous API", "version": app.version}
@@ -171,12 +258,19 @@ async def root():
 async def health():
     return {"ok": True, "ts": int(time.time())}
 
-# ============================================================
-# ROUTES: PSAs & herbaceous metrics
-# ============================================================
+# ---------------------------------------------------------------------
+# Routes: PSAs (GeoJSON)
+# ---------------------------------------------------------------------
 @app.get("/psas")
 async def psas(gacc: Optional[str] = Query(None, description="OSCC, ONCC, or both comma-separated")):
-    """Return CA PSA polygons (GeoJSON FeatureCollection)."""
+    """
+    Return CA PSA polygons as GeoJSON FeatureCollection (filtered to OSCC/ONCC if provided).
+    """
+    cache_key = f"psa_base:{gacc}"
+    cached = cache_get(cache_key)
+    if cached:
+        return cached
+
     params = {
         "where": "1=1",
         "outFields": "*",
@@ -187,181 +281,115 @@ async def psas(gacc: Optional[str] = Query(None, description="OSCC, ONCC, or bot
     data = await _http_get_json(NIFC_PSA_GEOJSON, params)
     feats = data.get("features", [])
     if not feats:
-        raise HTTPException(status_code=502, detail="No PSA features returned")
+        raise HTTPException(502, "No PSA features returned")
 
     wanted = {x.strip().upper() for x in gacc.split(",")} if gacc else None
     filtered = []
     for f in feats:
-        props = f.get("properties", {})
-        state_val = props.get("STATE") or props.get("ST") or props.get("State") or props.get("STATE_NAME")
-        gacc_val = props.get("GACC") or props.get("gacc")
-        if (state_val in ("CA", "California")) and (not wanted or (gacc_val and gacc_val.upper() in wanted)):
+        props = f.get("properties", {}) or {}
+        st = props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State")
+        g = props.get("GACC") or props.get("gacc")
+        if (st in ("CA", "California")) and (not wanted or (g and g.upper() in wanted)):
             filtered.append(f)
 
-    return {"type": "FeatureCollection", "features": filtered or feats}
+    out = {"type": "FeatureCollection", "features": filtered or feats}
+    cache_set(cache_key, out)
+    return out
 
-@app.get("/ca_psa_herbaceous")
-async def ca_psa_herbaceous(
-    year: Optional[int] = Query(None),
-    intervals: int = Query(1, ge=1, le=12),
-    gacc: Optional[str] = Query(None),
-    include_series: bool = Query(False),
+# ---------------------------------------------------------------------
+# Routes: RAP 10m per-PSA + PL points (AboveNormal)
+# ---------------------------------------------------------------------
+@app.get("/ca_psa_herbaceous_gee")
+async def ca_psa_herbaceous_gee(
+    gacc: Optional[str] = Query(None, description="OSCC, ONCC, or both comma-separated"),
 ):
-    """Return RAP herbaceous production (AFG/PFG/HER, lbs/ac) by PSA."""
-    cache_key = f"psa:{gacc}|year:{year}|int:{intervals}|series:{include_series}"
+    """
+    GeoJSON of PSAs with RAP 10 m vegetation cover stats:
+      - AFG, PFG (latest year % cover)
+      - AFG_norm, PFG_norm (2018â€“2023 normal)
+      - Total_current, Total_normal, PctDiff, AboveNormal (AFG+PFG combined)
+      - Year_latest
+    """
+    cache_key = f"gee10m_fc:{gacc}"
     cached = cache_get(cache_key)
     if cached:
         return cached
 
-    psa_fc = await psas(gacc)
-    feats = psa_fc["features"]
+    psa_fc = await psas(gacc=gacc)
+    feats = psa_fc.get("features", [])
+    if not feats:
+        out = {"type": "FeatureCollection", "features": []}
+        cache_set(cache_key, out, ttl=600)
+        return out
+
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
     async def worker(f: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        props = f.get("properties", {}) or {}
-        geom = f.get("geometry", {}) or {}
+        props = f.get("properties", {})
+        geom = f.get("geometry", {})
         if geom.get("type") not in ("Polygon", "MultiPolygon"):
             return None
-        geom = _thin_polygon(geom, 2000)
-
+        g = _thin_polygon(geom, 1500)
         async with sem:
-            rap_json = await _rap_for_polygon(geom, year)
+            rec = await _gee_latest_stats_for_geom(g)
 
-        series = _last_n(rap_json.get("production16day", []), intervals)
-        rec = {
+        outp = {
             "PSA_ID":   props.get("PSA_ID") or props.get("PSAID"),
             "PSA_NAME": props.get("PSA_NAME") or props.get("PSANAME"),
             "GACC":     props.get("GACC") or props.get("gacc"),
             "STATE":    props.get("STATE") or props.get("ST") or props.get("STATE_NAME") or props.get("State"),
         }
-        latest = series[-1] if series else None
-        if latest:
-            rec["AFG_latest"] = latest.get("AFG")
-            rec["PFG_latest"] = latest.get("PFG")
-            rec["HER_latest"] = latest.get("HER")
-            rec["IntervalDate_latest"] = latest.get("date")
-
-        if include_series:
-            for row in series:
-                d = row.get("date")
-                if d:
-                    rec[f"AFG_lbsac_{d}"] = row.get("AFG")
-                    rec[f"PFG_lbsac_{d}"] = row.get("PFG")
-                    rec[f"HER_lbsac_{d}"] = row.get("HER")
-
-        return {"type": "Feature", "geometry": geom, "properties": rec}
+        if rec:
+            outp.update({
+                "AFG_latest": rec.get("AFG"),
+                "PFG_latest": rec.get("PFG"),
+                "AFG_norm": rec.get("AFG_norm"),
+                "PFG_norm": rec.get("PFG_norm"),
+                "HER_total_latest": rec.get("Total_current"),
+                "HER_total_normal": rec.get("Total_normal"),
+                "HER_pct_diff": rec.get("PctDiff"),
+                "HER_above_normal": rec.get("AboveNormal"),
+                "Year_latest": rec.get("year"),
+            })
+        return {"type": "Feature", "geometry": g, "properties": outp}
 
     results = await asyncio.gather(*(worker(f) for f in feats))
-    out_features = [r for r in results if r]
-    out = {"type": "FeatureCollection", "features": out_features}
-    cache_set(cache_key, out)
-    return out
+    out_fc = {"type": "FeatureCollection", "features": [r for r in results if r]}
+    cache_set(cache_key, out_fc)
+    return out_fc
 
-# ============================================================
-# ROUTES: PL points (South Ops, North Ops, or both)
-# ============================================================
-def _pl_points_from_count(affected_count: int) -> int:
-    """
-    South Ops scale (default):
-      0â€“1 => 2 pts, 2â€“4 => 4 pts, 5â€“7 => 6 pts, 8â€“10 => 8 pts, 11+ => 10 pts
-    """
-    if affected_count <= 1:
-        return 2
-    if affected_count <= 4:
-        return 4
-    if affected_count <= 7:
-        return 6
-    if affected_count <= 10:
-        return 8
-    return 10
-
-async def _count_and_points_for_gacc(gacc_code: str, threshold_lbsac: float, metric: str, intervals: int) -> dict:
-    """Compute affected count and PL points for a single GACC."""
-    fc = await ca_psa_herbaceous(year=None, intervals=intervals, gacc=gacc_code, include_series=False)
-    feats = fc.get("features", [])
-    latest_date = None
-    affected = []
-
-    for f in feats:
-        props = f["properties"]
-        latest_date = latest_date or props.get("IntervalDate_latest")
-        val = props.get(f"{metric}_latest")
-        if val is not None and float(val) >= float(threshold_lbsac):
-            affected.append({
-                "PSA_ID": props.get("PSA_ID"),
-                "PSA_NAME": props.get("PSA_NAME"),
-                "GACC": props.get("GACC"),
-                f"{metric}_latest": val,
-            })
-
-    affected_count = len(affected)
-    return {
-        "gacc": gacc_code,
-        "total_psas": len(feats),
-        "affected_count": affected_count,
-        "points": _pl_points_from_count(affected_count),
-        "as_of_interval_date": latest_date,
-        "affected_psas": affected,
-    }
-
-@app.get("/pl_finefuel_points")
-async def pl_finefuel_points(
-    threshold_lbsac: float,
-    intervals: int = Query(1, ge=1, le=12, description="Latest interval is used for scoring."),
-    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
+@app.get("/pl_abovenormal_points_gee")
+async def pl_abovenormal_points_gee(
     gacc: str = Query("OSCC", description="OSCC, ONCC, or ONCC,OSCC"),
 ):
     """
-    Points for OSCC (South Ops), ONCC (North Ops), or both (comma-separated).
-    Returns per-GACC breakdown and overall counts. If both GACCs requested,
-    'overall.points' is None (since scales may differ).
+    PL points using RAP 10 m vegetation cover:
+      - Count PSAs where (AFG+PFG) latest > normal (2018â€“2023)
+      - Map count â†’ SouthOps scale (2,4,6,8,10)
     """
-    gaccs = [x.strip().upper() for x in gacc.split(",") if x.strip()]
-    gaccs = [x for x in dict.fromkeys(gaccs) if x in ("OSCC", "ONCC")]
-    if not gaccs:
-        gaccs = ["OSCC"]
+    fc = await ca_psa_herbaceous_gee(gacc=gacc)
+    feats = fc.get("features", [])
 
-    breakdown = []
-    latest = None
-    total_psas = 0
-    total_affected = 0
-
-    for g in gaccs:
-        res = await _count_and_points_for_gacc(g, threshold_lbsac, metric, intervals)
-        breakdown.append(res)
-        latest = latest or res["as_of_interval_date"]
-        total_psas += res["total_psas"]
-        total_affected += res["affected_count"]
-
-    overall_points = _pl_points_from_count(total_affected) if len(gaccs) == 1 else None
+    affected = 0
+    for f in feats:
+        p = f["properties"]
+        if p.get("HER_above_normal") is True:
+            affected += 1
 
     return {
-        "metric": metric,
-        "threshold_lbsac": threshold_lbsac,
-        "requested_gaccs": gaccs,
-        "as_of_interval_date": latest,
-        "overall": {
-            "total_psas": total_psas,
-            "affected_count": total_affected,
-            "points": overall_points
-        },
-        "breakdown": breakdown,
-        "scale_note": "South Ops bucket scale in use; provide North Ops scale if different."
+        "gacc": gacc,
+        "metric": "HER_cover_above_normal",
+        "total_psas": len(feats),
+        "affected_count": affected,
+        "points": _pl_points_from_count(affected),
+        "as_of_year": feats[0]["properties"].get("Year_latest") if feats else None
     }
 
 # Convenience aliases
-@app.get("/southops_pl_points")
-async def southops_pl_points(
-    threshold_lbsac: float,
-    intervals: int = Query(1, ge=1, le=12),
-    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
-):
-    return await pl_finefuel_points(threshold_lbsac=threshold_lbsac, intervals=intervals, metric=metric, gacc="OSCC")
+@app.get("/southops_pl_points_gee")
+async def southops_pl_points_gee():
+    return await pl_abovenormal_points_gee(gacc="OSCC")
 
-@app.get("/northops_pl_points")
-async def northops_pl_points(
-    threshold_lbsac: float,
-    intervals: int = Query(1, ge=1, le=12),
-    metric: str = Query("HER", pattern="^(HER|AFG|PFG)$"),
-):
-    return await pl_finefuel_points(threshold_lbsac=threshold_lbsac, intervals=intervals, metric=metric, gacc="ONCC")
+@app.get("/northops_pl_points_gee")
+async def northops_pl_points_gee():
+    return await pl_abovenormal_points_gee(gacc="ONCC")
