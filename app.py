@@ -10,24 +10,24 @@
 from __future__ import annotations
 
 import os
-import json
 import time
+import json
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 
-# ---- Logging ---------------------------------------------------------------
+# ---------------- Logging ----------------
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("ca-psa-her-api")
 
-# ---- Config ----------------------------------------------------------------
+# ---------------- Config -----------------
 PSA_NORMALS_CSV = os.environ.get("PSA_NORMALS_CSV", "psa_HER_norm_CA_v3.csv")
 EE_COLLECTION_16D_PROV = os.environ.get(
     "EE_COLLECTION_16D_PROV",
@@ -36,13 +36,13 @@ EE_COLLECTION_16D_PROV = os.environ.get(
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "900"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT_SEC", "60"))
 
-# PSA boundaries (public) – GeoJSON output
+# PSA boundaries (GeoJSON)
 PSA_URL = (
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer/0/query"
 )
 
-# ---- Tiny TTL cache --------------------------------------------------------
+# ---------------- Tiny TTL cache ---------
 class TTLCache:
     def __init__(self, ttl_s: int = 900):
         self.ttl = ttl_s
@@ -61,7 +61,7 @@ class TTLCache:
 
 cache = TTLCache(CACHE_TTL)
 
-# ---- Earth Engine init -----------------------------------------------------
+# ---------------- Earth Engine init ------
 EE_SERVICE_ACCOUNT = os.environ.get("EE_SERVICE_ACCOUNT")
 EE_PRIVATE_KEY_FILE = os.environ.get("EE_PRIVATE_KEY_FILE")
 
@@ -80,8 +80,8 @@ except Exception as e:
     log.error("Earth Engine init FAILED ❌ : %s", e)
     ee_ok = False
 
-# ---- FastAPI ---------------------------------------------------------------
-app = FastAPI(title="CA PSA Herbaceous API", version="3.3.1", openapi_url="/openapi.json")
+# ---------------- FastAPI ----------------
+app = FastAPI(title="CA PSA Herbaceous API", version="3.3.2", openapi_url="/openapi.json")
 
 
 def fetch_psa_geojson(limit: int = 10000) -> Dict[str, Any]:
@@ -97,7 +97,6 @@ def fetch_psa_geojson(limit: int = 10000) -> Dict[str, Any]:
     r = requests.get(PSA_URL, params=params, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     gj = r.json()
-    # sanity
     if "features" not in gj or not gj["features"]:
         raise RuntimeError("No PSA features returned.")
     return gj
@@ -105,26 +104,22 @@ def fetch_psa_geojson(limit: int = 10000) -> Dict[str, Any]:
 
 def ee_latest_her_by_psa(psa_geojson: Dict[str, Any]) -> pd.DataFrame:
     """
-    Compute latest HER (= afgNPP + pfgNPP) mean per PSA using RAP 16-day provisional.
-    Returns DataFrame with columns: PSANAME, GACCUnitID, HER_latest, afgNPP_latest, pfgNPP_latest
+    Compute latest HER (=afgNPP+pfgNPP) mean per PSA from RAP 16-day provisional.
+    Returns DataFrame: PSANAME, GACCUnitID, HER_latest, afgNPP_latest, pfgNPP_latest
     """
     if not ee_ok:
         raise RuntimeError("Earth Engine is not initialized")
 
-    # Collection & latest image
     col = ee.ImageCollection(EE_COLLECTION_16D_PROV)
     latest_img = col.sort("system:time_start", False).first()
     if latest_img is None:
         raise RuntimeError("No images in RAP 16-day collection")
 
-    # Bands: afgNPP, pfgNPP -> HER
     afg = latest_img.select("afgNPP")
     pfg = latest_img.select("pfgNPP")
     her = afg.add(pfg).rename("HER")
-
     stack = her.addBands(afg).addBands(pfg)  # HER, afgNPP, pfgNPP
 
-    # Convert GeoJSON features to ee.FeatureCollection (keep PSANAME, GACCUnitID)
     feats = []
     for f in psa_geojson.get("features", []):
         props = f.get("properties", {}) or {}
@@ -136,27 +131,20 @@ def ee_latest_her_by_psa(psa_geojson: Dict[str, Any]) -> pd.DataFrame:
         )
         gacc = props.get("GACCUnitID") or props.get("GACC") or props.get("gacc") or ""
         geom = f.get("geometry")
-
         if not geom or not geom.get("coordinates"):
             continue
-
         try:
-            ee_geom = ee.Geometry(geom)  # GeoJSON polygon/rings are accepted by EE
+            ee_geom = ee.Geometry(geom)
             feats.append(ee.Feature(ee_geom, {"PSANAME": psaname, "GACCUnitID": gacc}))
         except Exception:
-            # Skip malformed geometries
             continue
 
     fc = ee.FeatureCollection(feats)
 
-    # ReduceRegions: mean per PSA
-    # scale 30m (Landsat-based), bestEffort True to avoid memory overflows on large polys
     reduced = stack.reduceRegions(
         collection=fc, reducer=ee.Reducer.mean(), scale=30, bestEffort=True
     )
-
-    # Pull results to client
-    res = reduced.getInfo()  # list of dicts
+    res = reduced.getInfo()  # dict with "features"
     rows = []
     for it in res.get("features", []):
         p = it.get("properties", {}) or {}
@@ -169,21 +157,17 @@ def ee_latest_her_by_psa(psa_geojson: Dict[str, Any]) -> pd.DataFrame:
                 "pfgNPP_latest": p.get("pfgNPP_mean"),
             }
         )
-
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 def load_normals() -> pd.DataFrame:
-    """Load baseline normals CSV (PSANAME,GACCUnitID,afgNPP_norm,pfgNPP_norm,HER_norm)."""
+    """Load baseline normals CSV."""
     if not os.path.exists(PSA_NORMALS_CSV):
         raise FileNotFoundError(f"Normals CSV not found: {PSA_NORMALS_CSV}")
     df = pd.read_csv(PSA_NORMALS_CSV)
-    # Normalize key columns
     for col in ["PSANAME", "GACCUnitID"]:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
-    # Ensure HER_norm exists (if not, compute)
     if "HER_norm" not in df.columns:
         if {"afgNPP_norm", "pfgNPP_norm"}.issubset(df.columns):
             df["HER_norm"] = df["afgNPP_norm"].fillna(0) + df["pfgNPP_norm"].fillna(0)
@@ -193,86 +177,71 @@ def load_normals() -> pd.DataFrame:
 
 
 def compute_latest_flags_for(gacc_list: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Pull PSA polygons -> EE latest HER/afg/pfg means -> merge with normals -> flags.
-    """
-    # 1) PSA polygons (cached)
+    """PSA polygons -> EE latest means -> merge normals -> flags."""
+    # 1) PSA polygons (cache)
     gj = cache.get("psa_geojson")
     if gj is None:
         log.info("Fetching PSA polygons (GeoJSON) from ArcGIS…")
         gj = fetch_psa_geojson()
         cache.set("psa_geojson", gj)
 
-    # 2) Latest HER by PSA via EE (cached per latest date signature)
-    # Build a simple signature based on collection's latest date
-    latest_sig = cache.get("latest_sig")
+    # 2) Latest EE reduction (cache coarse sig)
     latest_df = cache.get("latest_df")
-
-    try:
-        if latest_sig is None or latest_df is None:
-            # compute now
+    if latest_df is None:
+        try:
             log.info("Reducing EE latest composite by PSA…")
             latest_df = ee_latest_her_by_psa(gj)
-            # If EE returned nothing (rare), safeguard
-            if latest_df is None or latest_df.empty:
-                log.warning("EE returned 0 PSA rows; proceeding with empty latest_df.")
-                latest_df = pd.DataFrame(
-                    columns=["PSANAME", "GACCUnitID", "HER_latest", "afgNPP_latest", "pfgNPP_latest"]
-                )
-            latest_sig = f"ts:{int(time.time())}"  # coarse signature
-            cache.set("latest_sig", latest_sig)
-            cache.set("latest_df", latest_df)
-    except Exception as e:
-        log.error("EE latest reduction failed: %s", e)
-        # still proceed with empty latest to avoid 500s
-        latest_df = pd.DataFrame(
-            columns=["PSANAME", "GACCUnitID", "HER_latest", "afgNPP_latest", "pfgNPP_latest"]
-        )
+        except Exception as e:
+            log.error("EE latest reduction failed: %s", e)
+            latest_df = pd.DataFrame(
+                columns=[
+                    "PSANAME",
+                    "GACCUnitID",
+                    "HER_latest",
+                    "afgNPP_latest",
+                    "pfgNPP_latest",
+                ]
+            )
+        cache.set("latest_df", latest_df)
 
-    # 3) Load normals
+    # 3) Normals
     normals = load_normals()
 
-    # 4) Optional filter by GACC list (USCAOSCC, USCAONCC, etc.)
+    # 4) Optional GACC filter (use normals as canonical)
     if gacc_list:
-        gacc_list_norm = [g.strip().upper() for g in gacc_list]
-        # Filter normals first (the canonical list)
+        gacc_norm = [g.strip().upper() for g in gacc_list if g.strip()]
         if "GACCUnitID" in normals.columns:
-            normals = normals[normals["GACCUnitID"].astype(str).str.upper().isin(gacc_list_norm)].copy()
+            normals = normals[
+                normals["GACCUnitID"].astype(str).str.upper().isin(gacc_norm)
+            ].copy()
 
-    # 5) Merge normals + latest
-    #    Use PSANAME + GACCUnitID as join keys where possible
+    # 5) Merge
     on_cols = []
     if "PSANAME" in normals.columns:
         on_cols.append("PSANAME")
     if "GACCUnitID" in normals.columns:
         on_cols.append("GACCUnitID")
-
     if not on_cols:
-        # last resort join by PSANAME
         on_cols = ["PSANAME"]
 
     merged = normals.merge(latest_df, on=on_cols, how="left")
-    log.info("Merging latest RAP (%d rows) with normals (%d rows)", len(latest_df), len(normals))
+    log.info("Merged latest RAP (%d rows) with normals (%d rows)", len(latest_df), len(normals))
 
-    # ---- SAFETY: avoid .fillna(value=HER_latest) ValueError
-    # Fill numeric latest columns with 0 instead of crashing
-    for c in ["HER_latest", "afgNPP_latest", "pfgNPP_latest"]:
+    # ---- SAFETY: make all numeric, kill NaN/inf before JSON
+    for c in ["HER_latest", "afgNPP_latest", "pfgNPP_latest", "HER_norm", "afgNPP_norm", "pfgNPP_norm"]:
         if c in merged.columns:
-            merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
+            merged[c] = pd.to_numeric(merged[c], errors="coerce")
 
-    # Ensure HER_norm exists and numeric
-    if "HER_norm" not in merged.columns:
-        merged["HER_norm"] = (
-            pd.to_numeric(merged.get("afgNPP_norm", 0), errors="coerce").fillna(0.0)
-            + pd.to_numeric(merged.get("pfgNPP_norm", 0), errors="coerce").fillna(0.0)
-        )
-    else:
-        merged["HER_norm"] = pd.to_numeric(merged["HER_norm"], errors="coerce").fillna(0.0)
+    merged = merged.replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
 
     # Compute flag
+    if "HER_latest" not in merged.columns:
+        merged["HER_latest"] = 0.0
+    if "HER_norm" not in merged.columns:
+        merged["HER_norm"] = 0.0
     merged["above_normal"] = merged["HER_latest"] > merged["HER_norm"]
 
-    # Minimal payload
+    # Output
     out_cols = [
         "PSANAME",
         "GACCUnitID",
@@ -285,29 +254,32 @@ def compute_latest_flags_for(gacc_list: Optional[List[str]] = None) -> Dict[str,
         "above_normal",
     ]
     existing = [c for c in out_cols if c in merged.columns]
-    # Replace NaN and infinite values with 0.0 to make JSON serialization safe
-merged = merged.replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
 
-rows = (
-    merged[existing]
-    .sort_values(["GACCUnitID", "PSANAME"], na_position="last")
-    .to_dict(orient="records")
-)
+    rows = (
+        merged[existing]
+        .sort_values(["GACCUnitID", "PSANAME"], na_position="last")
+        .to_dict(orient="records")
+    )
 
-# Convert any remaining numpy float types to native Python floats
-for r in rows:
-    for k, v in r.items():
-        if pd.isna(v) or v is None:
-            r[k] = 0.0
-        elif isinstance(v, (float, int)) and (v != v or v == float("inf") or v == float("-inf")):
-            r[k] = 0.0
+    # Final JSON safety: ensure native floats & no NaN/inf
+    for r in rows:
+        for k, v in list(r.items()):
+            # pandas/numpy may leave special floats; sanitize
+            try:
+                if v is None:
+                    r[k] = 0.0
+                elif isinstance(v, float):
+                    if (v != v) or v in (float("inf"), float("-inf")):
+                        r[k] = 0.0
+                elif isinstance(v, (int,)):
+                    r[k] = float(v)
+            except Exception:
+                r[k] = 0.0
 
-return {
-    "count": len(rows),
-    "rows": rows,
-}
+    return {"count": len(rows), "rows": rows}
 
-# --------------------- Routes ----------------------------------------------
+
+# ------------------- Routes -------------------
 
 @app.get("/")
 def root():
@@ -324,18 +296,19 @@ def health():
     }
 
 @app.get("/psa_flags")
-def psa_flags(gaccs: Optional[str] = Query(None, description="Comma-separated GACCs, e.g. USCAOSCC,USCAONCC")):
+def psa_flags(
+    gaccs: Optional[str] = Query(
+        None, description="Comma-separated GACCs, e.g. USCAOSCC,USCAONCC"
+    )
+):
     try:
-        gacc_list = None
-        if gaccs:
-            gacc_list = [g.strip() for g in gaccs.split(",") if g.strip()]
+        gacc_list = [g.strip() for g in gaccs.split(",")] if gaccs else None
         payload = compute_latest_flags_for(gacc_list)
         return JSONResponse(payload)
     except Exception as e:
         log.exception("psa_flags failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Convenience endpoint: just the latest composite date (best-effort)
 @app.get("/latest_info")
 def latest_info():
     if not ee_ok:
@@ -350,3 +323,8 @@ def latest_info():
     except Exception as e:
         return {"latest": None, "error": str(e), "collection": EE_COLLECTION_16D_PROV}
 
+
+# (Render runs with: uvicorn app:app --host 0.0.0.0 --port $PORT)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
