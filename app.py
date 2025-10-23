@@ -285,12 +285,27 @@ def compute_latest_flags_for(gacc_list: Optional[List[str]] = None) -> Dict[str,
         "above_normal",
     ]
     existing = [c for c in out_cols if c in merged.columns]
-    rows = merged[existing].sort_values(["GACCUnitID", "PSANAME"], na_position="last").to_dict(orient="records")
+    # Replace NaN and infinite values with 0.0 to make JSON serialization safe
+merged = merged.replace([float("inf"), float("-inf")], 0.0).fillna(0.0)
 
-    return {
-        "count": len(rows),
-        "rows": rows,
-    }
+rows = (
+    merged[existing]
+    .sort_values(["GACCUnitID", "PSANAME"], na_position="last")
+    .to_dict(orient="records")
+)
+
+# Convert any remaining numpy float types to native Python floats
+for r in rows:
+    for k, v in r.items():
+        if pd.isna(v) or v is None:
+            r[k] = 0.0
+        elif isinstance(v, (float, int)) and (v != v or v == float("inf") or v == float("-inf")):
+            r[k] = 0.0
+
+return {
+    "count": len(rows),
+    "rows": rows,
+}
 
 # --------------------- Routes ----------------------------------------------
 
@@ -334,3 +349,4 @@ def latest_info():
         return {"latest": ts, "collection": EE_COLLECTION_16D_PROV}
     except Exception as e:
         return {"latest": None, "error": str(e), "collection": EE_COLLECTION_16D_PROV}
+
