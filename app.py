@@ -1,11 +1,3 @@
-# app.py
-# CA PSA Herbaceous (HER) API — uses RAP 16-day provisional (afgNPP/pfgNPP) vs PSA normals CSV
-# Render env vars expected:
-#   EE_SERVICE_ACCOUNT        (e.g., finefuel@finefuelloading.iam.gserviceaccount.com)
-#   EE_PRIVATE_KEY_FILE       (/etc/secrets/ee-key.json)
-#   PSA_NORMALS_CSV           (default: psa_HER_norm_CA_v3.csv)
-#   EE_COLLECTION_16D_PROV    (default: projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional)
-#   CACHE_TTL                 (seconds; default 900)
 
 # app.py
 # CA PSA Herbaceous (HER) API — RAP 16-day provisional (afgNPP/pfgNPP) vs PSA normals CSV
@@ -304,3 +296,4 @@ def psa_flags(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+
