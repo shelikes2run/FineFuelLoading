@@ -8,278 +8,299 @@
 #   CACHE_TTL                 (seconds; default 900)
 
 # app.py
+# CA PSA Herbaceous (HER) API — RAP 16-day provisional (afgNPP/pfgNPP) vs PSA normals CSV
+# Env vars expected on Render (or local):
+#   EE_SERVICE_ACCOUNT      e.g. finefuel@finefuelloading.iam.gserviceaccount.com
+#   EE_PRIVATE_KEY_FILE     e.g. /etc/secrets/ee-key.json
+#   PSA_NORMALS_CSV         defaults to psa_HER_norm_CA_v3.csv
+#   EE_COLLECTION_16D_PROV  defaults to projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional
+#   HTTP_TIMEOUT_SEC        defaults to 60
+#   CORS_ALLOW_ORIGINS      defaults to "*"
+
+from __future__ import annotations
+
 import os
 import json
-import math
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 
 import pandas as pd
-import httpx
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# --------- Config from env ---------
-EE_SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT", "")
-EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "/etc/secrets/ee-key.json")
-EE_COLLECTION_16D = os.getenv(
-    "EE_COLLECTION_16D_PROV",
-    "projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional",
-)
-PSA_NORMALS_CSV = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CA_v3.csv")
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
+import ee
+import requests
 
-ARCGIS_PSA_URL = (
-    "https://services3.arcgis.com/TA0MspDblLP3tGMV/arcgis/rest/services/"
+# ----------------------------
+# Config / constants
+# ----------------------------
+PSA_FS_URL = (
+    "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer/0/query"
 )
 
-# --------- Earth Engine init ---------
-import ee  # type: ignore
+EE_COLLECTION_16D_PROV = os.getenv(
+    "EE_COLLECTION_16D_PROV",
+    "projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional",
+)
 
-def init_ee() -> Dict[str, Any]:
-    ok = False
-    msg = ""
+EE_SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT", "").strip()
+EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
+NORMALS_CSV = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CA_v3.csv")
+HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
+
+# ----------------------------
+# FastAPI
+# ----------------------------
+app = FastAPI(title="CA PSA Herbaceous API", version="4.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def safe_num(v):
+    """Convert to JSON-safe float; return None for NaN/inf/None."""
     try:
-        if EE_SERVICE_ACCOUNT and os.path.exists(EE_PRIVATE_KEY_FILE):
-            creds = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, EE_PRIVATE_KEY_FILE)
-            ee.Initialize(creds)
-        else:
-            ee.Initialize()
-        ok = True
-        msg = "EE initialized"
-    except Exception as e:
-        ok = False
-        msg = f"EE init failed: {e}"
-    return {"ok": ok, "message": msg}
+        if v is None:
+            return None
+        f = float(v)
+        if f != f:  # NaN
+            return None
+        if f in (float("inf"), float("-inf")):
+            return None
+        return f
+    except Exception:
+        return None
 
-EE_STATE = init_ee()
 
-# --------- Load normals CSV once ---------
-# Expected columns: PSANAME, GACCUnitID, afgNPP_norm, pfgNPP_norm, HER_norm
+def parse_gaccs_param(gaccs_raw: Optional[str]) -> Optional[List[str]]:
+    if not gaccs_raw:
+        return None
+    vals = [s.strip().upper() for s in gaccs_raw.split(",") if s.strip()]
+    return vals or None
+
+
+# ----------------------------
+# Load normals (CSV) at startup
+#   Required columns:
+#   PSANationalCode, PSANAME, GACCUnitID, afgNPP_norm, pfgNPP_norm, HER_norm
+# ----------------------------
+def load_normals(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Normals CSV not found: {path}")
+    df = pd.read_csv(path)
+
+    required = [
+        "PSANationalCode", "PSANAME", "GACCUnitID",
+        "afgNPP_norm", "pfgNPP_norm", "HER_norm"
+    ]
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Normals CSV missing column: {col}")
+
+    df["PSA_KEY"] = df["PSANationalCode"].astype(str).str.upper().str.strip()
+    # Keep label fields for output, too
+    return df[["PSA_KEY", "PSANationalCode", "PSANAME", "GACCUnitID",
+               "afgNPP_norm", "pfgNPP_norm", "HER_norm"]]
+
+
+# Initialize EE once
+EE_READY = False
 try:
-    NORMALS = pd.read_csv(PSA_NORMALS_CSV).fillna("")
-except Exception:
-    NORMALS = pd.DataFrame(columns=["PSANAME","GACCUnitID","afgNPP_norm","pfgNPP_norm","HER_norm"])
+    if EE_SERVICE_ACCOUNT and EE_PRIVATE_KEY_FILE:
+        creds = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, EE_PRIVATE_KEY_FILE)
+        ee.Initialize(creds)
+    else:
+        ee.Initialize()
+    EE_READY = True
+except Exception as e:
+    print("EE init failed:", e)
 
-# Helper: normalize GACC input
-def parse_gaccs(raw: Optional[str]) -> List[str]:
-    if not raw:
-        return []
-    raw = raw.replace(";", ",")
-    vals = [v.strip() for v in raw.split(",") if v.strip()]
-    # Only two valid for CA, but keep generic
-    return list(dict.fromkeys(vals))
+# Load normals once
+NORMALS_DF: Optional[pd.DataFrame] = None
+try:
+    NORMALS_DF = load_normals(NORMALS_CSV)
+    print(f"Loaded normals: {len(NORMALS_DF)} rows from {NORMALS_CSV}")
+except Exception as e:
+    print("Normals load failed:", e)
 
-# --------- ArcGIS fetch (robust) ---------
-async def fetch_psa_features(gaccs: List[str]) -> Dict[str, Any]:
-    if not gaccs:
-        return {"features": [], "error": None}
+# ----------------------------
+# Fetch PSA polygons from ArcGIS (filtered by GACC if provided)
+# We only request the fields we need and always include PSANationalCode.
+# ----------------------------
+def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
+    params = {
+        "f": "geojson",
+        "outSR": 4326,
+        "returnGeometry": "true",
+        "outFields": "PSANationalCode,PSANAME,GACCUnitID",
+        "where": "1=1",
+    }
 
-    where = "GACCUnitID IN ({})".format(
-        ",".join([f"'{g}'" for g in gaccs])
-    )
+    if gaccs:
+        # Robust where clause: GACCUnitID IN ('USCAOSCC','USCAONCC')
+        quoted = ",".join([f"'{g}'" for g in gaccs])
+        params["where"] = f"GACCUnitID IN ({quoted})"
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        # attempt 1: f=json, explicit outFields
-        params = {
-            "where": where,
-            "returnGeometry": "true",
-            "outFields": "OBJECTID,PSANAME,GACCUnitID,PSANationalCode",
-            "outSR": 4326,
-            "f": "json",
-        }
-        try:
-            r = await client.get(ARCGIS_PSA_URL, params=params)
-            r.raise_for_status()
-            data = r.json()
-            # Convert ArcGIS JSON to GeoJSON FeatureCollection
-            feats = []
-            for feat in data.get("features", []):
-                attrs = feat.get("attributes", {}) or {}
-                geom = feat.get("geometry", {}) or {}
-                # polygon rings -> GeoJSON polygon
-                if "rings" in geom:
-                    coordinates = geom["rings"]
-                    gj = {
-                        "type": "Feature",
-                        "properties": attrs,
-                        "geometry": {"type": "Polygon", "coordinates": coordinates},
-                    }
-                    feats.append(gj)
-            return {"features": feats, "error": None}
-        except Exception as e1:
-            err1 = str(e1)
+    r = requests.get(PSA_FS_URL, params=params, timeout=HTTP_TIMEOUT_SEC)
+    r.raise_for_status()
+    gj = r.json()
+    features = gj.get("features", [])
 
-        # attempt 2: f=geojson
-        params2 = {
-            "where": where,
-            "returnGeometry": "true",
-            "outFields": "*",
-            "outSR": 4326,
-            "f": "geojson",
-        }
-        try:
-            r2 = await client.get(ARCGIS_PSA_URL, params=params2)
-            r2.raise_for_status()
-            data2 = r2.json()
-            feats2 = data2.get("features", [])
-            return {"features": feats2, "error": None}
-        except Exception as e2:
-            return {"features": [], "error": f"ArcGIS fetch failed: {err1} | {e2}"}
-
-# --------- EE: latest composite + zonal means ---------
-def ee_latest_image_and_date(coll_id: str) -> Dict[str, Any]:
-    try:
-        coll = ee.ImageCollection(coll_id).sort("system:time_start", False)
-        img = coll.first()
-        info = img.getInfo()
-        ts = info["properties"]["system:time_start"]
-        date = ee.Date(ts).format("YYYY-MM-dd").getInfo()
-        return {"image": ee.Image(img), "date": date, "error": None}
-    except Exception as e:
-        return {"image": None, "date": None, "error": str(e)}
-
-def ee_reduce_means(img: ee.Image, features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Prepare EE FeatureCollection carrying PSA props we care about
     ee_feats = []
     for f in features:
         props = f.get("properties", {}) or {}
-        geom  = f.get("geometry", {}) or {}
+        geom = f.get("geometry")
         if not geom:
             continue
-        try:
-            ee_geom = ee.Geometry(geom)
-            ee_feat = ee.Feature(ee_geom, {
-                "PSANAME": props.get("PSANAME",""),
-                "GACCUnitID": props.get("GACCUnitID",""),
-                "PSANationalCode": props.get("PSANationalCode",""),
-            })
-            ee_feats.append(ee_feat)
-        except Exception:
-            # skip broken geometry
+
+        psa_code = str(props.get("PSANationalCode", "")).upper().strip()
+        if not psa_code:
+            # Skip any polygon without a national code
             continue
 
-    if not ee_feats:
-        return []
+        props_out = {
+            "PSA_KEY": psa_code,                       # canonical join key
+            "PSANationalCode": psa_code,
+            "PSANAME": props.get("PSANAME"),
+            "GACCUnitID": props.get("GACCUnitID"),
+        }
+        ee_feats.append(ee.Feature(ee.Geometry(geom), props_out))
 
-    fc = ee.FeatureCollection(ee_feats)
+    return ee.FeatureCollection(ee_feats)
 
-    # Bands we care about (NPP partitioned: afgNPP, pfgNPP, HER)
-    bands = []
-    for b in ["afgNPP", "pfgNPP", "HER"]:
-        try:
-            # only include if present
-            _ = img.select(b)
-            bands.append(b)
-        except Exception:
-            pass
-    if not bands:
-        return []
 
-    red = img.select(bands).reduceRegions(
-        collection=fc,
+# ----------------------------
+# Core: compute latest flags vs normals
+# ----------------------------
+def compute_latest_flags(gaccs_list: Optional[List[str]]):
+    if not EE_READY:
+        raise HTTPException(status_code=500, detail="Earth Engine not initialized on server.")
+    if NORMALS_DF is None or NORMALS_DF.empty:
+        raise HTTPException(status_code=500, detail="Normals table not loaded.")
+
+    # Latest RAP 16-day composite
+    coll = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
+    latest = coll.first()
+    latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+
+    # Bands + HER
+    img = latest.select(["afgNPP", "pfgNPP"])
+    her = img.select("afgNPP").add(img.select("pfgNPP")).rename("HER")
+    stack = img.addBands(her)  # afgNPP, pfgNPP, HER
+
+    # PSA polygons (filtered by GACC if provided)
+    psa_fc = get_psa_fc(gaccs_list)
+
+    # Mean per polygon @ 30m; tileScale for large regions
+    stats_fc = stack.reduceRegions(
+        collection=psa_fc,
         reducer=ee.Reducer.mean(),
-        scale=30  # RAP 16-day provisional is 30 m
+        scale=30,
+        tileScale=4
+    )
+    stats = stats_fc.getInfo().get("features", [])
+
+    # To DF
+    latest_rows = []
+    for f in stats:
+        p = f.get("properties", {}) or {}
+        latest_rows.append({
+            "PSA_KEY": p.get("PSA_KEY"),
+            "PSANationalCode": p.get("PSANationalCode"),
+            "PSANAME": p.get("PSANAME"),
+            "GACCUnitID": p.get("GACCUnitID"),
+            "afgNPP_latest": safe_num(p.get("afgNPP")),
+            "pfgNPP_latest": safe_num(p.get("pfgNPP")),
+            "HER_latest": safe_num(p.get("HER")),
+        })
+    latest_df = pd.DataFrame(latest_rows)
+
+    if latest_df.empty:
+        return {
+            "count": 0,
+            "gaccs": gaccs_list or [],
+            "collection": EE_COLLECTION_16D_PROV,
+            "latest_composite": latest_date,
+            "rows": []
+        }
+
+    # Merge with normals on PSA_KEY (PSANationalCode)
+    merged = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("", "_norms"))
+
+    # above_normal flag (HER)
+    merged["above_normal"] = (
+        (merged["HER_latest"].fillna(-1e9) > merged["HER_norm"].fillna(1e9)).astype(int)
     )
 
-    out = red.getInfo().get("features", [])
-    rows = []
-    for f in out:
-        p = f.get("properties", {}) or {}
-        rows.append({
-            "PSANAME": p.get("PSANAME",""),
-            "GACCUnitID": p.get("GACCUnitID",""),
-            "PSANationalCode": p.get("PSANationalCode",""),
-            "afgNPP_latest": p.get("afgNPP_mean"),
-            "pfgNPP_latest": p.get("pfgNPP_mean"),
-            "HER_latest":   p.get("HER_mean"),
-        })
-    return rows
-
-# --------- Merge with normals, compute flags ---------
-def merge_with_normals(latest_rows: List[Dict[str,Any]]) -> List[Dict[str,Any]]:
-    if not latest_rows:
-        return []
-
-    latest = pd.DataFrame(latest_rows)
-    # Left-join to your CSV by PSANAME; if that ever misses, try PSANationalCode
-    m = latest.merge(NORMALS, on=["PSANAME","GACCUnitID"], how="left")
-
-    # Flag above normal (HER as primary, but keep per-part too)
-    def gt(a, b):
-        try:
-            return float(a) > float(b)
-        except Exception:
-            return None
-
+    # Build payload rows
     out = []
-    for _, r in m.iterrows():
+    for _, r in merged.iterrows():
         out.append({
-            "PSANAME": r.get("PSANAME",""),
-            "PSANationalCode": r.get("PSANationalCode",""),
-            "GACCUnitID": r.get("GACCUnitID",""),
-            "afgNPP_latest": r.get("afgNPP_latest"),
-            "pfgNPP_latest": r.get("pfgNPP_latest"),
-            "HER_latest":    r.get("HER_latest"),
-            "afgNPP_norm":   r.get("afgNPP_norm"),
-            "pfgNPP_norm":   r.get("pfgNPP_norm"),
-            "HER_norm":      r.get("HER_norm"),
-            "above_normal":  gt(r.get("HER_latest"), r.get("HER_norm")),
+            "PSA": r.get("PSANationalCode"),         # the canonical code
+            "PSANAME": r.get("PSANAME"),
+            "GACCUnitID": r.get("GACCUnitID"),
+            "afgNPP_latest": safe_num(r.get("afgNPP_latest")),
+            "pfgNPP_latest": safe_num(r.get("pfgNPP_latest")),
+            "HER_latest":    safe_num(r.get("HER_latest")),
+            "afgNPP_norm":   safe_num(r.get("afgNPP_norm")),
+            "pfgNPP_norm":   safe_num(r.get("pfgNPP_norm")),
+            "HER_norm":      safe_num(r.get("HER_norm")),
+            "above_normal":  int(r.get("above_normal", 0)),
         })
-    return out
 
-# --------- FastAPI ---------
-app = FastAPI()
+    return {
+        "count": len(out),
+        "gaccs": gaccs_list or [],
+        "collection": EE_COLLECTION_16D_PROV,
+        "latest_composite": latest_date,
+        "rows": out
+    }
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return "CA PSA Herbaceous API — try /psa_flags?gaccs=USCAOSCC,USCAONCC&pretty=1"
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "ee_initialized": EE_STATE["ok"],
-        "normals_csv": PSA_NORMALS_CSV,
+        "ee_initialized": EE_READY,
+        "normals_csv": NORMALS_CSV,
     }
 
 @app.get("/psa_flags")
-async def psa_flags(
-    gaccs: Optional[str] = Query(None, description="Comma or semicolon separated GACC IDs (e.g. USCAOSCC,USCAONCC)"),
-    pretty: Optional[int] = Query(0)
+def psa_flags(
+    gaccs: Optional[str] = Query(None, description="Comma-separated GACCUnitID values (e.g., USCAOSCC,USCAONCC)"),
+    pretty: Optional[int] = Query(0, description="Pretty-print JSON if 1"),
+    pretty1: Optional[int] = Query(0, description="Alias for pretty=1"),
 ):
-    if not EE_STATE["ok"]:
-        return JSONResponse(status_code=500, content={"detail": EE_STATE["message"]})
+    try:
+        gacc_list = parse_gaccs_param(gaccs)
+        payload = compute_latest_flags(gacc_list)
 
-    gacc_list = parse_gaccs(gaccs)
-    # ArcGIS: get PSA polygons + IDs
-    ag = await fetch_psa_features(gacc_list)
+        if bool(pretty) or bool(pretty1):
+            return PlainTextResponse(json.dumps(payload, indent=2), media_type="application/json")
+        return JSONResponse(payload)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    # EE: find latest composite and zonal means
-    latest_info = ee_latest_image_and_date(EE_COLLECTION_16D)
-    payload: Dict[str, Any] = {
-        "count": 0,
-        "gaccs": gacc_list,
-        "collection": EE_COLLECTION_16D,
-        "latest_composite": latest_info["date"],
-        "rows": [],
-    }
 
-    if ag["error"]:
-        payload["error"] = ag["error"]
-
-    rows = []
-    if (latest_info["image"] is not None) and ag["features"]:
-        rows = ee_reduce_means(latest_info["image"], ag["features"])
-        merged = merge_with_normals(rows)
-        payload["rows"] = merged
-        payload["count"] = len(merged)
-
-    # pretty-print switch
-    if pretty:
-        return JSONResponse(
-            content=json.loads(json.dumps(payload, indent=2, allow_nan=False)),
-            media_type="application/json",
-        )
-    else:
-        # ensure strict JSON (no NaN/inf)
-        return JSONResponse(
-            content=json.loads(json.dumps(payload, allow_nan=False)),
-            media_type="application/json",
-        )
+# ----------------------------
+# Local run
+# ----------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
