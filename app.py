@@ -94,12 +94,12 @@ def load_normals(path: str) -> pd.DataFrame:
         raise FileNotFoundError(f"Normals CSV not found: {path}")
     df = pd.read_csv(path)
     # Normalize column names we rely on
-    need = ["PSANAME", "GACCUnitID", "afgNPP_norm", "pfgNPP_norm", "HER_norm"]
+    need = ["PSANationalCode","PSANAME", "GACCUnitID", "afgNPP_norm", "pfgNPP_norm", "HER_norm"]
     for col in need:
         if col not in df.columns:
             raise ValueError(f"Normals CSV missing column: {col}")
     # Ensure PSA/GACC are uppercased for robust joins
-    df["PSA_KEY"] = df["PSANAME"].astype(str).str.upper().str.strip() + "|" + df["GACCUnitID"].astype(str).str.upper().str.strip()
+    df["PSA_KEY"] = df["PSANationalCode"].astype(str).str.upper().str.strip() + df["PSANAME"].astype(str).str.upper().str.strip() + "|" + df["GACCUnitID"].astype(str).str.upper().str.strip()
     return df[["PSA_KEY"] + need]
 
 
@@ -139,7 +139,7 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
 
     params = {
         "where": "1=1",
-        "outFields": "PSANAME,GACCUnitID",
+        "outFields": "PSANationalCode,PSANAME,GACCUnitID",
         "returnGeometry": "true",
         "f": "geojson",
         "outSR": 4326,
@@ -161,8 +161,8 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
         geom = f.get("geometry", None)
         if not geom:
             continue
-        key = (str(props.get("PSANAME", "")).upper().strip()
-               + "|" + str(props.get("GACCUnitID", "")).upper().strip())
+        key = (str(props.get("PSANationalCode", "")).upper().strip()
+               + "|" + str(props.get("PSANAME", "")).upper().strip()  + "|" + str(props.get("GACCUnitID", "")).upper().strip())
         props["PSA_KEY"] = key
         ee_geom = ee.Geometry(geom)
         ee_feats.append(ee.Feature(ee_geom, props))
@@ -207,6 +207,7 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
         psa_key = str(props.get("PSA_KEY", "")).upper().strip()
         rows.append({
             "PSA_KEY": psa_key,
+            "PSANationalCode": props.get("PSANationalCode")
             "PSANAME": props.get("PSANAME"),
             "GACCUnitID": props.get("GACCUnitID"),
             "afgNPP_latest": safe_num(props.get("afgNPP")),
@@ -227,6 +228,7 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
     out = []
     for _, r in merged.iterrows():
         out.append({
+            "PSANationalCode": r.get("PSANationalCode"),
             "PSANAME": r.get("PSANAME"),
             "GACCUnitID": r.get("GACCUnitID"),
             "afgNPP_latest": safe_num(r.get("afgNPP_latest")),
@@ -289,3 +291,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
     uvicorn.run("app:app", host="0.0.0.0", port=port)
+
