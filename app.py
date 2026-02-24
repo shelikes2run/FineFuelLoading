@@ -1,4 +1,3 @@
-
 # app.py
 # CA PSA Herbaceous (HER) API — RAP 16-day provisional (afgNPP/pfgNPP) vs PSA normals CSV
 # Env vars expected on Render (or local):
@@ -296,4 +295,3 @@ def psa_flags(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
-
