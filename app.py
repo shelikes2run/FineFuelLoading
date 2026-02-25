@@ -9,17 +9,17 @@
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
 #
-# CHANGES FROM v4 → v6:
-#   1. FIX: above_normal — null-safe; PSAs missing normals return null not 0
-#   2. FIX: load_normals() filters out "No PSA Assigned" junk rows
-#   3. FIX: get_psa_fc() paginates ArcGIS (handles exceededTransferLimit)
-#   4. FIX: tileScale scales automatically — 4/8/16 based on query size
-#   5. FIX: above_normal flag uses correct null-safe comparison
-#   6. NEW: Default CSV → psa_HER_norm_CONUS_v1.csv
-#   7. NEW: gaccs in response lists actual GACCs found in results
-#   8. NEW: /health reports normals row count
-#   9. NEW: /generate_normals endpoint — computes CONUS normals CSV via GEE,
-#           returns as downloadable CSV. Run once then redeploy with the file.
+# CHANGES v4 → v7:
+#   1. FIX: above_normal null-safe (fillna(1e9) bug removed)
+#   2. FIX: load_normals() strips junk "No PSA Assigned" rows
+#   3. FIX: get_psa_fc() paginates ArcGIS (exceededTransferLimit)
+#   4. FIX: tileScale auto-scales 4/8/16 by query size
+#   5. NEW: Default CSV → psa_HER_norm_CONUS_v1.csv
+#   6. NEW: gaccs in response lists actual GACCs in results
+#   7. NEW: /health reports normals row count
+#   8. FIX: /generate_normals — switched to ARCHIVED collection (1986–2024),
+#           all-time mean (no DOY filtering), scale=90m, geometry simplify,
+#           tileScale=16 for CONUS
 
 from __future__ import annotations
 import os
@@ -45,6 +45,11 @@ EE_COLLECTION_16D_PROV = os.getenv(
     "EE_COLLECTION_16D_PROV",
     "projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional",
 )
+# Archived collection used for normals generation (1986–2024 long-term mean)
+EE_COLLECTION_16D_ARCH = os.getenv(
+    "EE_COLLECTION_16D_ARCH",
+    "projects/rap-data-365417/assets/npp-partitioned-16day-v3",
+)
 EE_SERVICE_ACCOUNT  = os.getenv("EE_SERVICE_ACCOUNT",  "").strip()
 EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
 NORMALS_CSV         = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
@@ -53,7 +58,7 @@ HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
 # ----------------------------
 # FastAPI
 # ----------------------------
-app = FastAPI(title="CONUS PSA Herbaceous API", version="6.0.0")
+app = FastAPI(title="CONUS PSA Herbaceous API", version="7.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -66,7 +71,6 @@ app.add_middleware(
 # Utilities
 # ----------------------------
 def safe_num(v):
-    """Convert to JSON-safe float; return None for NaN/inf/None."""
     try:
         if v is None:
             return None
@@ -88,27 +92,20 @@ def parse_gaccs_param(gaccs_raw: Optional[str]) -> Optional[List[str]]:
 
 
 # ----------------------------
-# Load normals (CSV) at startup
-#   Required columns:
-#   PSANationalCode, PSANAME, GACCUnitID, afgNPP_norm, pfgNPP_norm, HER_norm
+# Load normals CSV at startup
 # ----------------------------
 def load_normals(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Normals CSV not found: {path}")
     df = pd.read_csv(path)
-    required = [
-        "PSANationalCode", "PSANAME", "GACCUnitID",
-        "afgNPP_norm", "pfgNPP_norm", "HER_norm",
-    ]
+    required = ["PSANationalCode", "PSANAME", "GACCUnitID",
+                "afgNPP_norm", "pfgNPP_norm", "HER_norm"]
     for col in required:
         if col not in df.columns:
             raise ValueError(f"Normals CSV missing column: {col}")
-
-    # Drop junk rows — blank codes and "No PSA Assigned" variants
     df = df[df["PSANationalCode"].notna()]
     df = df[df["PSANationalCode"].astype(str).str.strip() != ""]
     df = df[~df["PSANationalCode"].astype(str).str.lower().str.startswith("no psa")]
-
     df["PSA_KEY"] = df["PSANationalCode"].astype(str).str.upper().str.strip()
     return df[["PSA_KEY", "PSANationalCode", "PSANAME", "GACCUnitID",
                "afgNPP_norm", "pfgNPP_norm", "HER_norm"]]
@@ -136,8 +133,7 @@ except Exception as e:
 
 
 # ----------------------------
-# Fetch PSA polygons from ArcGIS
-# Paginates through exceededTransferLimit for national queries
+# Fetch PSA polygons from ArcGIS (paginated)
 # ----------------------------
 def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
     where = "1=1"
@@ -151,12 +147,10 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
 
     while True:
         params = {
-            "f":                 "geojson",
-            "outSR":             4326,
-            "returnGeometry":    "true",
-            "outFields":         "PSANationalCode,PSANAME,GACCUnitID",
-            "where":             where,
-            "resultOffset":      offset,
+            "f": "geojson", "outSR": 4326, "returnGeometry": "true",
+            "outFields": "PSANationalCode,PSANAME,GACCUnitID",
+            "where": where,
+            "resultOffset": offset,
             "resultRecordCount": page_size,
         }
         r = requests.get(PSA_FS_URL, params=params, timeout=HTTP_TIMEOUT_SEC)
@@ -164,7 +158,6 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
         gj   = r.json()
         page = gj.get("features", [])
         all_features.extend(page)
-
         if not gj.get("exceededTransferLimit", False) or not page:
             break
         offset += len(page)
@@ -197,20 +190,16 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
     if NORMALS_DF is None or NORMALS_DF.empty:
         raise HTTPException(status_code=500, detail="Normals table not loaded.")
 
-    # Latest RAP 16-day composite
     coll        = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
     latest      = coll.first()
     latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
 
-    # Bands + HER
     img   = latest.select(["afgNPP", "pfgNPP"])
     her   = img.select("afgNPP").add(img.select("pfgNPP")).rename("HER")
     stack = img.addBands(her)
 
-    # PSA polygons
     psa_fc = get_psa_fc(gaccs_list)
 
-    # tileScale: 4 = single GACC, 8 = 2-4 GACCs, 16 = 5+ or full CONUS
     if not gaccs_list:
         tile_scale = 16
     elif len(gaccs_list) >= 5:
@@ -244,22 +233,13 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
 
     if latest_df.empty:
         return {
-            "count":            0,
-            "gaccs":            gaccs_list or [],
-            "collection":       EE_COLLECTION_16D_PROV,
-            "latest_composite": latest_date,
-            "rows":             [],
+            "count": 0, "gaccs": gaccs_list or [],
+            "collection": EE_COLLECTION_16D_PROV,
+            "latest_composite": latest_date, "rows": [],
         }
 
-    # Merge with normals
-    merged = pd.merge(
-        latest_df, NORMALS_DF,
-        on="PSA_KEY", how="left",
-        suffixes=("", "_norms"),
-    )
+    merged = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("", "_norms"))
 
-    # Null-safe above_normal flag
-    # 1 = above normal | 0 = below/at normal | None = no normals data for this PSA
     merged["above_normal"] = pd.NA
     valid = merged["HER_latest"].notna() & merged["HER_norm"].notna()
     merged.loc[valid, "above_normal"] = (
@@ -299,9 +279,14 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
-        "CONUS PSA Herbaceous API v6 — /psa_flags?pretty=1 for all CONUS\n"
-        "Filter by GACC: /psa_flags?gaccs=USCAOSCC,USCAONCC&pretty=1\n\n"
-        "Available GACCs:\n"
+        "CONUS PSA Herbaceous API v7\n\n"
+        "Endpoints:\n"
+        "  /psa_flags                  All CONUS (omit gaccs param)\n"
+        "  /psa_flags?gaccs=USCAONCC  Filter by GACC\n"
+        "  /psa_flags?pretty=1         Human-readable JSON\n"
+        "  /generate_normals           One-time: build CONUS normals CSV\n"
+        "  /health                     Status check\n\n"
+        "GACC codes:\n"
         "  USCAONCC  Northern California\n"
         "  USCAOSCC  Southern California\n"
         "  USGBONCC  Great Basin\n"
@@ -311,8 +296,7 @@ def root():
         "  USNRFNCC  Northwest\n"
         "  USSASWCC  Southern Area\n"
         "  USEASNCC  Eastern Area\n"
-        "  USNRENCC  Northeast\n\n"
-        "One-time setup: /generate_normals  (generates CONUS normals CSV via GEE)\n"
+        "  USNRENCC  Northeast\n"
     )
 
 
@@ -328,9 +312,9 @@ def health():
 
 @app.get("/psa_flags")
 def psa_flags(
-    gaccs:   Optional[str] = Query(None, description="Comma-separated GACCUnitID values; omit for all CONUS"),
-    pretty:  Optional[int] = Query(0,    description="Pretty-print JSON if 1"),
-    pretty1: Optional[int] = Query(0,    description="Alias for pretty=1"),
+    gaccs:   Optional[str] = Query(None),
+    pretty:  Optional[int] = Query(0),
+    pretty1: Optional[int] = Query(0),
 ):
     try:
         gacc_list = parse_gaccs_param(gaccs)
@@ -345,75 +329,104 @@ def psa_flags(
 
 
 @app.get("/generate_normals")
-def generate_normals(
-    baseline_start: int = Query(2017, description="First year of baseline period"),
-    baseline_end:   int = Query(2022, description="Last year of baseline period"),
-    doy_window:     int = Query(8,    description="Days +/- around target DOY to search"),
-):
+def generate_normals():
     """
-    ONE-TIME SETUP ENDPOINT.
+    ONE-TIME SETUP — generates psa_HER_norm_CONUS_v1.csv.
 
-    Computes CONUS PSA normals from the RAP 16-day provisional collection
-    using the GEE credentials already configured on this server.
+    Uses the ARCHIVED RAP 16-day collection (1986–2024) and computes the
+    all-time mean of afgNPP and pfgNPP across all available composites.
+    This matches the method used to generate the original CA normals.
 
-    Steps:
-      1. Hit this URL in your browser — it will take 10-15 minutes
-      2. Your browser will download psa_HER_norm_CONUS_v1.csv automatically
-      3. Add that CSV to your repo and redeploy
-      4. Update PSA_NORMALS_CSV env var to psa_HER_norm_CONUS_v1.csv
-      5. All CONUS PSAs will then return correct above_normal values
+    - Collection : projects/rap-data-365417/assets/npp-partitioned-16day-v3
+    - Date range : 1986-01-01 → 2025-01-01 (all available composites)
+    - Stat       : mean of ALL composites (no DOY filtering)
+    - Scale      : 90 m  (matches original CA generation)
+    - tileScale  : 16    (required for CONUS scale)
+    - Geometry   : simplify(maxError=120) per polygon
 
-    Optional parameters:
-      ?baseline_start=2017&baseline_end=2022&doy_window=8
+    Hit this URL once (expect 15-30 min) then commit the downloaded CSV
+    to your repo as psa_HER_norm_CONUS_v1.csv and redeploy.
     """
     if not EE_READY:
         raise HTTPException(status_code=500, detail="Earth Engine not initialized.")
 
-    # Determine target DOY from latest composite
-    coll       = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
-    latest     = coll.first()
-    latest_ms  = latest.get("system:time_start").getInfo()
-    latest_dt  = datetime.datetime.utcfromtimestamp(latest_ms / 1000)
-    target_doy = latest_dt.timetuple().tm_yday
-    print(f"generate_normals: target DOY {target_doy} ({latest_dt.date()}), "
-          f"baseline {baseline_start}–{baseline_end}, window ±{doy_window} days")
+    print("generate_normals: starting — archived collection, all-time mean, 90m scale")
 
-    # Collect one matching composite per baseline year
-    baseline_imgs = []
-    for year in range(baseline_start, baseline_end + 1):
-        base_date    = datetime.date(year, 1, 1) + datetime.timedelta(days=target_doy - 1)
-        window_start = (base_date - datetime.timedelta(days=doy_window)).isoformat()
-        window_end   = (base_date + datetime.timedelta(days=doy_window + 1)).isoformat()
-        year_coll    = coll.filterDate(window_start, window_end)
-        count        = year_coll.size().getInfo()
-        if count > 0:
-            baseline_imgs.append(year_coll.sort("system:time_start").first())
-            print(f"  {year}: composite found in window")
-        else:
-            print(f"  {year}: no composite — skipping")
+    # ── Step 1: Build the all-time mean image from the archived collection ──
+    arch = ee.ImageCollection(EE_COLLECTION_16D_ARCH).filterDate("1986-01-01", "2025-01-01")
 
-    if not baseline_imgs:
-        raise HTTPException(status_code=500, detail="No baseline composites found for specified period.")
+    # Confirm images exist
+    n_imgs = arch.size().getInfo()
+    if n_imgs == 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"No images found in archived collection {EE_COLLECTION_16D_ARCH}."
+        )
+    print(f"generate_normals: {n_imgs} composites found in archived collection")
 
-    # Average baseline composites
-    mean_img   = ee.ImageCollection(baseline_imgs).select(["afgNPP", "pfgNPP"]).mean()
-    her_band   = mean_img.select("afgNPP").add(mean_img.select("pfgNPP")).rename("HER")
-    norm_stack = mean_img.addBands(her_band)
+    mean_bands = arch.select(["afgNPP", "pfgNPP"]).mean()
+    her_band   = mean_bands.select("afgNPP").add(mean_bands.select("pfgNPP")).rename("HER")
+    norm_stack = ee.Image.cat([mean_bands, her_band])   # bands: afgNPP, pfgNPP, HER
 
-    # All CONUS PSA polygons
-    psa_fc = get_psa_fc(None)
+    # ── Step 2: Fetch all CONUS PSA polygons (paginated), with simplification ──
+    print("generate_normals: fetching PSA polygons from ArcGIS ...")
+    all_features: list = []
+    offset    = 0
+    page_size = 1000
 
-    print("generate_normals: running reduceRegions for all CONUS PSAs ...")
+    while True:
+        params = {
+            "f": "geojson", "outSR": 4326, "returnGeometry": "true",
+            "outFields": "PSANationalCode,PSANAME,GACCUnitID",
+            "where": "1=1",
+            "resultOffset": offset,
+            "resultRecordCount": page_size,
+        }
+        r = requests.get(PSA_FS_URL, params=params, timeout=HTTP_TIMEOUT_SEC)
+        r.raise_for_status()
+        gj   = r.json()
+        page = gj.get("features", [])
+        all_features.extend(page)
+        if not gj.get("exceededTransferLimit", False) or not page:
+            break
+        offset += len(page)
+
+    ee_feats = []
+    skipped  = 0
+    for f in all_features:
+        props    = f.get("properties", {}) or {}
+        geom_raw = f.get("geometry")
+        psa_code = str(props.get("PSANationalCode", "")).upper().strip()
+        if not geom_raw or not psa_code or psa_code.lower().startswith("no psa"):
+            skipped += 1
+            continue
+        # Simplify geometry to reduce GEE payload size (matches original 90m.ipynb)
+        geom = ee.Geometry(geom_raw).simplify(maxError=120)
+        ee_feats.append(ee.Feature(geom, {
+            "PSA_KEY":         psa_code,
+            "PSANationalCode": psa_code,
+            "PSANAME":         props.get("PSANAME", ""),
+            "GACCUnitID":      props.get("GACCUnitID", ""),
+        }))
+
+    print(f"generate_normals: {len(ee_feats)} valid PSA polygons ({skipped} skipped)")
+    if not ee_feats:
+        raise HTTPException(status_code=500, detail="No valid PSA polygons returned from ArcGIS.")
+
+    psa_fc = ee.FeatureCollection(ee_feats)
+
+    # ── Step 3: reduceRegions at 90m ──
+    print("generate_normals: running reduceRegions (scale=90m, tileScale=16) — this may take 15-30 min ...")
     stats_fc = norm_stack.reduceRegions(
         collection=psa_fc,
         reducer=ee.Reducer.mean(),
-        scale=30,
+        scale=90,
         tileScale=16,
     )
     stats = stats_fc.getInfo().get("features", [])
     print(f"generate_normals: {len(stats)} PSA results returned")
 
-    # Build CSV
+    # ── Step 4: Build CSV ──
     rows = []
     for f in stats:
         p        = f.get("properties", {}) or {}
@@ -433,7 +446,12 @@ def generate_normals(
     buf = io.StringIO()
     df.to_csv(buf, index=False)
 
-    print(f"generate_normals: returning CSV with {len(df)} rows")
+    null_count = df["HER_norm"].isna().sum()
+    print(
+        f"generate_normals: done — {len(df)} PSAs "
+        f"({null_count} with null HER_norm — check geometry/RAP coverage)"
+    )
+
     return PlainTextResponse(
         buf.getvalue(),
         media_type="text/csv",
