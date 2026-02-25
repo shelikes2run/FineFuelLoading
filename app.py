@@ -1,11 +1,12 @@
-# app.py
-# CONUS PSA Herbaceous (HER) API — RAP 16-day provisional (afgNPP/pfgNPP) vs PSA normals CSV
+# app.py  v7
+# CONUS PSA Herbaceous (HER) API — RAP 16-day provisional vs PSA normals CSV
 #
 # Env vars expected on Render (or local):
 #   EE_SERVICE_ACCOUNT      e.g. finefuel@finefuelloading.iam.gserviceaccount.com
 #   EE_PRIVATE_KEY_FILE     e.g. /etc/secrets/ee-key.json
 #   PSA_NORMALS_CSV         defaults to psa_HER_norm_CONUS_v1.csv
-#   EE_COLLECTION_16D_PROV  defaults to projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional
+#   EE_COLLECTION_16D_PROV  defaults to …npp-partitioned-16day-v3-provisional
+#   EE_COLLECTION_16D_ARCH  defaults to …npp-partitioned-16day-v3  (archived 1986-2024)
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
 #
@@ -17,26 +18,31 @@
 #   5. NEW: Default CSV → psa_HER_norm_CONUS_v1.csv
 #   6. NEW: gaccs in response lists actual GACCs in results
 #   7. NEW: /health reports normals row count
-#   8. FIX: /generate_normals — switched to ARCHIVED collection (1986–2024),
-#           all-time mean (no DOY filtering), scale=90m, geometry simplify,
-#           tileScale=16 for CONUS
+#   8. FIX: /generate_normals uses ARCHIVED collection (1986-2024), all-time
+#           mean, scale=90m, geometry simplify — fixes 502/timeout by running
+#           in a background thread and returning immediately.
+#   9. NEW: /normals_status  — poll job progress; returns CSV when complete.
 
 from __future__ import annotations
-import os
 import io
 import json
+import os
+import threading
+import time
+import uuid
 import datetime
 from typing import List, Optional
+
 import pandas as pd
-from fastapi import FastAPI, Query, HTTPException
+import requests
+import ee
+from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-import ee
-import requests
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Config / constants
-# ----------------------------
+# ─────────────────────────────────────────
 PSA_FS_URL = (
     "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
     "DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer/0/query"
@@ -45,7 +51,7 @@ EE_COLLECTION_16D_PROV = os.getenv(
     "EE_COLLECTION_16D_PROV",
     "projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional",
 )
-# Archived collection used for normals generation (1986–2024 long-term mean)
+# Archived collection — all historical composites 1986-2024
 EE_COLLECTION_16D_ARCH = os.getenv(
     "EE_COLLECTION_16D_ARCH",
     "projects/rap-data-365417/assets/npp-partitioned-16day-v3",
@@ -55,9 +61,9 @@ EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
 NORMALS_CSV         = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
 HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
 
-# ----------------------------
+# ─────────────────────────────────────────
 # FastAPI
-# ----------------------------
+# ─────────────────────────────────────────
 app = FastAPI(title="CONUS PSA Herbaceous API", version="7.0.0")
 app.add_middleware(
     CORSMiddleware,
@@ -67,17 +73,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------------------
+# ─────────────────────────────────────────
+# In-memory job store for /generate_normals
+# ─────────────────────────────────────────
+# Structure:
+#   JOBS[job_id] = {
+#       "status":   "running" | "complete" | "error",
+#       "started":  ISO timestamp,
+#       "message":  human-readable progress string,
+#       "csv":      CSV text (only when status=="complete"),
+#       "rows":     int,
+#       "error":    error string (only when status=="error"),
+#   }
+JOBS: dict = {}
+JOBS_LOCK = threading.Lock()
+
+
+# ─────────────────────────────────────────
 # Utilities
-# ----------------------------
+# ─────────────────────────────────────────
 def safe_num(v):
     try:
         if v is None:
             return None
         f = float(v)
-        if f != f:
-            return None
-        if f in (float("inf"), float("-inf")):
+        if f != f or f in (float("inf"), float("-inf")):
             return None
         return f
     except Exception:
@@ -91,9 +111,9 @@ def parse_gaccs_param(gaccs_raw: Optional[str]) -> Optional[List[str]]:
     return vals or None
 
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Load normals CSV at startup
-# ----------------------------
+# ─────────────────────────────────────────
 def load_normals(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Normals CSV not found: {path}")
@@ -111,7 +131,9 @@ def load_normals(path: str) -> pd.DataFrame:
                "afgNPP_norm", "pfgNPP_norm", "HER_norm"]]
 
 
-# Initialize EE once
+# ─────────────────────────────────────────
+# Initialize EE once at startup
+# ─────────────────────────────────────────
 EE_READY = False
 try:
     if EE_SERVICE_ACCOUNT and EE_PRIVATE_KEY_FILE:
@@ -123,7 +145,7 @@ try:
 except Exception as e:
     print("EE init failed:", e)
 
-# Load normals once at startup
+# Load normals CSV once at startup
 NORMALS_DF: Optional[pd.DataFrame] = None
 try:
     NORMALS_DF = load_normals(NORMALS_CSV)
@@ -132,10 +154,11 @@ except Exception as e:
     print("Normals load failed:", e)
 
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Fetch PSA polygons from ArcGIS (paginated)
-# ----------------------------
+# ─────────────────────────────────────────
 def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
+    """Fetch PSA polygons for /psa_flags (no geometry simplification needed)."""
     where = "1=1"
     if gaccs:
         quoted = ",".join([f"'{g}'" for g in gaccs])
@@ -166,10 +189,8 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
     for f in all_features:
         props    = f.get("properties", {}) or {}
         geom     = f.get("geometry")
-        if not geom:
-            continue
         psa_code = str(props.get("PSANationalCode", "")).upper().strip()
-        if not psa_code:
+        if not geom or not psa_code:
             continue
         ee_feats.append(ee.Feature(ee.Geometry(geom), {
             "PSA_KEY":         psa_code,
@@ -181,9 +202,9 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
     return ee.FeatureCollection(ee_feats)
 
 
-# ----------------------------
+# ─────────────────────────────────────────
 # Core: compute latest flags vs normals
-# ----------------------------
+# ─────────────────────────────────────────
 def compute_latest_flags(gaccs_list: Optional[List[str]]):
     if not EE_READY:
         raise HTTPException(status_code=500, detail="Earth Engine not initialized on server.")
@@ -273,9 +294,139 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
     }
 
 
-# ----------------------------
+# ─────────────────────────────────────────
+# Background worker for /generate_normals
+# ─────────────────────────────────────────
+def _run_generate_normals(job_id: str):
+    """
+    Runs in a background thread.  Writes progress updates to JOBS[job_id].
+    On completion stores the CSV text in JOBS[job_id]["csv"].
+    """
+    def _update(msg: str):
+        print(f"[{job_id}] {msg}")
+        with JOBS_LOCK:
+            JOBS[job_id]["message"] = msg
+
+    try:
+        _update("Starting — connecting to archived RAP collection (1986-2024)")
+
+        # ── Step 1: all-time mean from archived collection ──────────────────
+        arch = ee.ImageCollection(EE_COLLECTION_16D_ARCH).filterDate("1986-01-01", "2025-01-01")
+
+        n_imgs = arch.size().getInfo()
+        if n_imgs == 0:
+            raise RuntimeError(
+                f"No images found in archived collection: {EE_COLLECTION_16D_ARCH}"
+            )
+        _update(f"Archived collection has {n_imgs} composites — computing all-time mean")
+
+        mean_bands = arch.select(["afgNPP", "pfgNPP"]).mean()
+        her_band   = mean_bands.select("afgNPP").add(mean_bands.select("pfgNPP")).rename("HER")
+        norm_stack = ee.Image.cat([mean_bands, her_band])  # bands: afgNPP, pfgNPP, HER
+
+        # ── Step 2: Fetch all CONUS PSA polygons with simplification ────────
+        _update("Fetching PSA polygons from ArcGIS (all CONUS)...")
+
+        all_features: list = []
+        offset    = 0
+        page_size = 1000
+
+        while True:
+            params = {
+                "f": "geojson", "outSR": 4326, "returnGeometry": "true",
+                "outFields": "PSANationalCode,PSANAME,GACCUnitID",
+                "where": "1=1",
+                "resultOffset": offset,
+                "resultRecordCount": page_size,
+            }
+            r = requests.get(PSA_FS_URL, params=params, timeout=HTTP_TIMEOUT_SEC)
+            r.raise_for_status()
+            gj   = r.json()
+            page = gj.get("features", [])
+            all_features.extend(page)
+            if not gj.get("exceededTransferLimit", False) or not page:
+                break
+            offset += len(page)
+
+        ee_feats = []
+        skipped  = 0
+        for f in all_features:
+            props    = f.get("properties", {}) or {}
+            geom_raw = f.get("geometry")
+            psa_code = str(props.get("PSANationalCode", "")).upper().strip()
+            if not geom_raw or not psa_code or psa_code.lower().startswith("no psa"):
+                skipped += 1
+                continue
+            # Simplify geometry — reduces GEE memory and matches original CA method
+            geom = ee.Geometry(geom_raw).simplify(maxError=120)
+            ee_feats.append(ee.Feature(geom, {
+                "PSA_KEY":         psa_code,
+                "PSANationalCode": psa_code,
+                "PSANAME":         props.get("PSANAME", ""),
+                "GACCUnitID":      props.get("GACCUnitID", ""),
+            }))
+
+        _update(f"Got {len(ee_feats)} PSA polygons ({skipped} skipped) — running reduceRegions at 90m...")
+        if not ee_feats:
+            raise RuntimeError("No valid PSA polygons returned from ArcGIS.")
+
+        psa_fc = ee.FeatureCollection(ee_feats)
+
+        # ── Step 3: reduceRegions ────────────────────────────────────────────
+        # scale=90m, tileScale=16 — matches the method that produced the CA CSV
+        stats_fc = norm_stack.reduceRegions(
+            collection=psa_fc,
+            reducer=ee.Reducer.mean(),
+            scale=90,
+            tileScale=16,
+        )
+        stats = stats_fc.getInfo().get("features", [])
+        _update(f"reduceRegions complete — {len(stats)} PSA results returned — building CSV...")
+
+        # ── Step 4: Build CSV ────────────────────────────────────────────────
+        rows = []
+        for f in stats:
+            p        = f.get("properties", {}) or {}
+            psa_code = p.get("PSANationalCode", "")
+            if not psa_code:
+                continue
+            rows.append({
+                "PSANationalCode": psa_code,
+                "PSANAME":         p.get("PSANAME",    ""),
+                "GACCUnitID":      p.get("GACCUnitID", ""),
+                "afgNPP_norm":     safe_num(p.get("afgNPP")),
+                "pfgNPP_norm":     safe_num(p.get("pfgNPP")),
+                "HER_norm":        safe_num(p.get("HER")),
+            })
+
+        df  = pd.DataFrame(rows).sort_values(["GACCUnitID", "PSANationalCode"])
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        csv_text   = buf.getvalue()
+        null_count = df["HER_norm"].isna().sum()
+
+        with JOBS_LOCK:
+            JOBS[job_id]["status"]  = "complete"
+            JOBS[job_id]["csv"]     = csv_text
+            JOBS[job_id]["rows"]    = len(df)
+            JOBS[job_id]["message"] = (
+                f"Done — {len(df)} PSAs written "
+                f"({null_count} with null HER_norm)"
+            )
+        print(f"[{job_id}] complete — {len(df)} PSAs")
+
+    except Exception as exc:
+        err = str(exc)
+        print(f"[{job_id}] ERROR: {err}")
+        with JOBS_LOCK:
+            JOBS[job_id]["status"]  = "error"
+            JOBS[job_id]["error"]   = err
+            JOBS[job_id]["message"] = f"Failed: {err}"
+
+
+# ─────────────────────────────────────────
 # Routes
-# ----------------------------
+# ─────────────────────────────────────────
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
@@ -284,7 +435,8 @@ def root():
         "  /psa_flags                  All CONUS (omit gaccs param)\n"
         "  /psa_flags?gaccs=USCAONCC  Filter by GACC\n"
         "  /psa_flags?pretty=1         Human-readable JSON\n"
-        "  /generate_normals           One-time: build CONUS normals CSV\n"
+        "  /generate_normals           ONE-TIME: start CONUS normals job (returns instantly)\n"
+        "  /normals_status?job_id=...  Poll job; downloads CSV when complete\n"
         "  /health                     Status check\n\n"
         "GACC codes:\n"
         "  USCAONCC  Northern California\n"
@@ -302,11 +454,17 @@ def root():
 
 @app.get("/health")
 def health():
+    with JOBS_LOCK:
+        active_jobs = {
+            jid: {"status": jdata["status"], "message": jdata["message"]}
+            for jid, jdata in JOBS.items()
+        }
     return {
         "status":         "ok",
         "ee_initialized": EE_READY,
         "normals_csv":    NORMALS_CSV,
         "normals_rows":   len(NORMALS_DF) if NORMALS_DF is not None else 0,
+        "active_jobs":    active_jobs,
     }
 
 
@@ -329,139 +487,85 @@ def psa_flags(
 
 
 @app.get("/generate_normals")
-def generate_normals():
+def generate_normals(background_tasks: BackgroundTasks):
     """
-    ONE-TIME SETUP — generates psa_HER_norm_CONUS_v1.csv.
+    ONE-TIME SETUP — starts a background job to generate psa_HER_norm_CONUS_v1.csv.
 
-    Uses the ARCHIVED RAP 16-day collection (1986–2024) and computes the
-    all-time mean of afgNPP and pfgNPP across all available composites.
-    This matches the method used to generate the original CA normals.
+    Returns IMMEDIATELY with a job_id.  The actual GEE computation runs in the
+    background (typically 15-30 minutes).  Poll /normals_status?job_id=<id>
+    to check progress; when status=="complete" the CSV is returned as a download.
 
-    - Collection : projects/rap-data-365417/assets/npp-partitioned-16day-v3
-    - Date range : 1986-01-01 → 2025-01-01 (all available composites)
-    - Stat       : mean of ALL composites (no DOY filtering)
-    - Scale      : 90 m  (matches original CA generation)
-    - tileScale  : 16    (required for CONUS scale)
-    - Geometry   : simplify(maxError=120) per polygon
-
-    Hit this URL once (expect 15-30 min) then commit the downloaded CSV
-    to your repo as psa_HER_norm_CONUS_v1.csv and redeploy.
+    Method:
+      - Collection : projects/rap-data-365417/assets/npp-partitioned-16day-v3 (archived)
+      - Date range : 1986-01-01 to 2025-01-01 (all composites)
+      - Stat       : mean of ALL composites  (no DOY filtering)
+      - Scale      : 90 m   (matches original CA normals generation)
+      - tileScale  : 16     (CONUS scale)
+      - Geometry   : simplify(maxError=120) per polygon
     """
     if not EE_READY:
         raise HTTPException(status_code=500, detail="Earth Engine not initialized.")
 
-    print("generate_normals: starting — archived collection, all-time mean, 90m scale")
-
-    # ── Step 1: Build the all-time mean image from the archived collection ──
-    arch = ee.ImageCollection(EE_COLLECTION_16D_ARCH).filterDate("1986-01-01", "2025-01-01")
-
-    # Confirm images exist
-    n_imgs = arch.size().getInfo()
-    if n_imgs == 0:
-        raise HTTPException(
-            status_code=500,
-            detail=f"No images found in archived collection {EE_COLLECTION_16D_ARCH}."
-        )
-    print(f"generate_normals: {n_imgs} composites found in archived collection")
-
-    mean_bands = arch.select(["afgNPP", "pfgNPP"]).mean()
-    her_band   = mean_bands.select("afgNPP").add(mean_bands.select("pfgNPP")).rename("HER")
-    norm_stack = ee.Image.cat([mean_bands, her_band])   # bands: afgNPP, pfgNPP, HER
-
-    # ── Step 2: Fetch all CONUS PSA polygons (paginated), with simplification ──
-    print("generate_normals: fetching PSA polygons from ArcGIS ...")
-    all_features: list = []
-    offset    = 0
-    page_size = 1000
-
-    while True:
-        params = {
-            "f": "geojson", "outSR": 4326, "returnGeometry": "true",
-            "outFields": "PSANationalCode,PSANAME,GACCUnitID",
-            "where": "1=1",
-            "resultOffset": offset,
-            "resultRecordCount": page_size,
+    job_id = str(uuid.uuid4())[:8]
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status":  "running",
+            "started": datetime.datetime.utcnow().isoformat() + "Z",
+            "message": "Job queued",
+            "csv":     None,
+            "rows":    0,
+            "error":   None,
         }
-        r = requests.get(PSA_FS_URL, params=params, timeout=HTTP_TIMEOUT_SEC)
-        r.raise_for_status()
-        gj   = r.json()
-        page = gj.get("features", [])
-        all_features.extend(page)
-        if not gj.get("exceededTransferLimit", False) or not page:
-            break
-        offset += len(page)
 
-    ee_feats = []
-    skipped  = 0
-    for f in all_features:
-        props    = f.get("properties", {}) or {}
-        geom_raw = f.get("geometry")
-        psa_code = str(props.get("PSANationalCode", "")).upper().strip()
-        if not geom_raw or not psa_code or psa_code.lower().startswith("no psa"):
-            skipped += 1
-            continue
-        # Simplify geometry to reduce GEE payload size (matches original 90m.ipynb)
-        geom = ee.Geometry(geom_raw).simplify(maxError=120)
-        ee_feats.append(ee.Feature(geom, {
-            "PSA_KEY":         psa_code,
-            "PSANationalCode": psa_code,
-            "PSANAME":         props.get("PSANAME", ""),
-            "GACCUnitID":      props.get("GACCUnitID", ""),
-        }))
+    background_tasks.add_task(_run_generate_normals, job_id)
 
-    print(f"generate_normals: {len(ee_feats)} valid PSA polygons ({skipped} skipped)")
-    if not ee_feats:
-        raise HTTPException(status_code=500, detail="No valid PSA polygons returned from ArcGIS.")
-
-    psa_fc = ee.FeatureCollection(ee_feats)
-
-    # ── Step 3: reduceRegions at 90m ──
-    print("generate_normals: running reduceRegions (scale=90m, tileScale=16) — this may take 15-30 min ...")
-    stats_fc = norm_stack.reduceRegions(
-        collection=psa_fc,
-        reducer=ee.Reducer.mean(),
-        scale=90,
-        tileScale=16,
-    )
-    stats = stats_fc.getInfo().get("features", [])
-    print(f"generate_normals: {len(stats)} PSA results returned")
-
-    # ── Step 4: Build CSV ──
-    rows = []
-    for f in stats:
-        p        = f.get("properties", {}) or {}
-        psa_code = p.get("PSANationalCode", "")
-        if not psa_code:
-            continue
-        rows.append({
-            "PSANationalCode": psa_code,
-            "PSANAME":         p.get("PSANAME",    ""),
-            "GACCUnitID":      p.get("GACCUnitID", ""),
-            "afgNPP_norm":     safe_num(p.get("afgNPP")),
-            "pfgNPP_norm":     safe_num(p.get("pfgNPP")),
-            "HER_norm":        safe_num(p.get("HER")),
-        })
-
-    df  = pd.DataFrame(rows).sort_values(["GACCUnitID", "PSANationalCode"])
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-
-    null_count = df["HER_norm"].isna().sum()
-    print(
-        f"generate_normals: done — {len(df)} PSAs "
-        f"({null_count} with null HER_norm — check geometry/RAP coverage)"
-    )
-
-    return PlainTextResponse(
-        buf.getvalue(),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=psa_HER_norm_CONUS_v1.csv"},
-    )
+    return JSONResponse({
+        "job_id":  job_id,
+        "status":  "running",
+        "message": "Job started. Poll /normals_status?job_id=" + job_id,
+        "poll_url": f"/normals_status?job_id={job_id}",
+    })
 
 
-# ----------------------------
+@app.get("/normals_status")
+def normals_status(job_id: str = Query(..., description="Job ID from /generate_normals")):
+    """
+    Poll the status of a /generate_normals job.
+
+    - status == "running"  → still computing; check message for progress
+    - status == "complete" → CSV is returned as a downloadable file
+    - status == "error"    → something went wrong; check error field
+    """
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    if job["status"] == "complete":
+        return PlainTextResponse(
+            job["csv"],
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": "attachment; filename=psa_HER_norm_CONUS_v1.csv",
+                "X-Job-Rows": str(job["rows"]),
+                "X-Job-Message": job["message"],
+            },
+        )
+
+    # running or error — return JSON status
+    return JSONResponse({
+        "job_id":  job_id,
+        "status":  job["status"],
+        "started": job["started"],
+        "message": job["message"],
+        "error":   job.get("error"),
+    })
+
+
+# ─────────────────────────────────────────
 # Local run
-# ----------------------------
+# ─────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
