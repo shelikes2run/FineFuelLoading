@@ -1,4 +1,4 @@
-# app.py  v9
+# app.py  v10
 # CONUS PSA Herbaceous (HER) API — RAP 16-day provisional vs PSA normals CSV
 #
 # Env vars expected on Render:
@@ -10,12 +10,12 @@
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
 #
-# CHANGES v8 → v9:
-#   KEY FIX: replaced synchronous getInfo() on every request with a startup
-#   cache. On boot the server computes all CONUS PSA flags in a background
-#   thread and stores the result in memory. Every /psa_flags request is served
-#   instantly from cache — no GEE call on the request path, no 502 possible.
-#   Cache refreshes every CACHE_REFRESH_HOURS (default 6).
+# CHANGES v9 → v10:
+#   KEY FIX: process one GACC at a time in the background cache loop instead
+#   of all 240 CONUS PSAs in a single reduceRegions call.
+#   This keeps peak memory well under 512MB, eliminating the OOM crash on Render.
+#   Each GACC is fetched, reduced, and released before the next begins.
+#   If one GACC fails (GEE timeout etc.) the rest still complete.
 
 from __future__ import annotations
 import io, json, os, threading, time, uuid, datetime
@@ -47,8 +47,22 @@ NORMALS_CSV          = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
 HTTP_TIMEOUT_SEC     = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
 CACHE_REFRESH_HOURS  = float(os.getenv("CACHE_REFRESH_HOURS", "6"))
 
+# All CONUS GACCs — processed one at a time to keep memory low
+GACC_CODES = [
+    "USAKACC",
+    "USCAONCC",
+    "USCAOSCC",
+    "USCORMC",
+    "USGASAC",
+    "USMTNRC",
+    "USNMSWC",
+    "USORNWC",
+    "USUTGBC",
+    "USWIEACC",
+]
+
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="CONUS PSA Herbaceous API", version="9.0.0")
+app = FastAPI(title="CONUS PSA Herbaceous API", version="10.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -64,6 +78,7 @@ _CACHE: dict = {
     "computed_at":      None,     # datetime of last successful compute
     "status":           "starting", # "starting" | "ready" | "error"
     "error":            None,
+    "gacc_progress":    {},       # per-GACC status for diagnostics
 }
 _CACHE_LOCK = threading.Lock()
 
@@ -122,7 +137,7 @@ try:
 except Exception as e:
     print("Normals load failed:", e)
 
-# ── Fetch PSA polygons ────────────────────────────────────────────────────────
+# ── Fetch PSA polygons for a single GACC ─────────────────────────────────────
 def get_psa_fc(gaccs: Optional[List[str]] = None) -> ee.FeatureCollection:
     where = "1=1"
     if gaccs:
@@ -166,18 +181,19 @@ def get_psa_fc(gaccs: Optional[List[str]] = None) -> ee.FeatureCollection:
 # ── Core compute (runs in background thread only) ─────────────────────────────
 def _compute_all_conus():
     """
-    Fetches the latest provisional composite, runs reduceRegions for all
-    CONUS PSAs, merges with normals, and stores results in _CACHE.
-    Called at startup and every CACHE_REFRESH_HOURS thereafter.
+    Processes one GACC at a time to keep peak memory low.
+    Results are accumulated incrementally and stored in _CACHE when all done.
+    If a single GACC fails, the rest still complete.
     Never called on the HTTP request path — no 502 risk.
     """
-    print("Cache: starting CONUS computation ...")
+    print("Cache: starting CONUS computation (per-GACC batching) ...")
     try:
         if not EE_READY:
             raise RuntimeError("Earth Engine not initialized")
         if NORMALS_DF is None or NORMALS_DF.empty:
             raise RuntimeError("Normals table not loaded")
 
+        # Resolve latest composite date once (lightweight call)
         coll        = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
         latest      = coll.first()
         latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
@@ -187,31 +203,54 @@ def _compute_all_conus():
         her   = img.select("afgNPP").add(img.select("pfgNPP")).rename("HER")
         stack = img.addBands(her)
 
-        psa_fc = get_psa_fc(None)   # all CONUS
+        all_latest_rows = []
+        gacc_progress   = {}
 
-        stats_fc = stack.reduceRegions(
-            collection=psa_fc,
-            reducer=ee.Reducer.mean(),
-            scale=90,
-            tileScale=16,
-        )
-        stats = stats_fc.getInfo().get("features", [])
-        print(f"Cache: {len(stats)} PSA results from GEE")
+        for gacc in GACC_CODES:
+            print(f"Cache: processing {gacc} ...")
+            try:
+                psa_fc   = get_psa_fc([gacc])
+                fc_size  = psa_fc.size().getInfo()
 
-        latest_rows = []
-        for f in stats:
-            p = f.get("properties", {}) or {}
-            latest_rows.append({
-                "PSA_KEY":         p.get("PSA_KEY"),
-                "PSANationalCode": p.get("PSANationalCode"),
-                "PSANAME":         p.get("PSANAME"),
-                "GACCUnitID":      p.get("GACCUnitID"),
-                "afgNPP_latest":   safe_num(p.get("afgNPP")),
-                "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
-                "HER_latest":      safe_num(p.get("HER")),
-            })
-        latest_df = pd.DataFrame(latest_rows)
-        merged    = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("","_norms"))
+                if fc_size == 0:
+                    print(f"Cache: {gacc} — 0 valid PSAs, skipping")
+                    gacc_progress[gacc] = {"status": "skipped", "psas": 0}
+                    continue
+
+                stats_fc = stack.reduceRegions(
+                    collection=psa_fc,
+                    reducer=ee.Reducer.mean(),
+                    scale=90,
+                    tileScale=16,
+                )
+                stats = stats_fc.getInfo().get("features", [])
+                print(f"Cache: {gacc} — {len(stats)} results")
+
+                for f in stats:
+                    p = f.get("properties", {}) or {}
+                    all_latest_rows.append({
+                        "PSA_KEY":         p.get("PSA_KEY"),
+                        "PSANationalCode": p.get("PSANationalCode"),
+                        "PSANAME":         p.get("PSANAME"),
+                        "GACCUnitID":      p.get("GACCUnitID"),
+                        "afgNPP_latest":   safe_num(p.get("afgNPP")),
+                        "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
+                        "HER_latest":      safe_num(p.get("HER")),
+                    })
+                gacc_progress[gacc] = {"status": "ok", "psas": len(stats)}
+
+            except Exception as gacc_exc:
+                print(f"Cache: {gacc} failed — {gacc_exc}")
+                gacc_progress[gacc] = {"status": "error", "error": str(gacc_exc)}
+                # continue to next GACC — don't abort entire run
+                continue
+
+        # Merge with normals
+        latest_df = pd.DataFrame(all_latest_rows)
+        if latest_df.empty:
+            raise RuntimeError("No PSA results returned from any GACC")
+
+        merged = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("","_norms"))
 
         merged["above_normal"] = pd.NA
         valid = merged["HER_latest"].notna() & merged["HER_norm"].notna()
@@ -241,8 +280,9 @@ def _compute_all_conus():
             _CACHE["computed_at"]      = datetime.datetime.utcnow().isoformat() + "Z"
             _CACHE["status"]           = "ready"
             _CACHE["error"]            = None
+            _CACHE["gacc_progress"]    = gacc_progress
 
-        print(f"Cache: ready — {len(rows)} PSA rows stored")
+        print(f"Cache: ready — {len(rows)} PSA rows stored across {len(gacc_progress)} GACCs")
 
     except Exception as exc:
         print(f"Cache: compute failed — {exc}")
@@ -272,12 +312,12 @@ else:
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
-        "CONUS PSA Herbaceous API v9\n\n"
+        "CONUS PSA Herbaceous API v10\n\n"
         "Endpoints:\n"
         "  /psa_flags                  All CONUS (served from cache)\n"
         "  /psa_flags?gaccs=USCAONCC  Filter by GACC (comma-separated)\n"
         "  /psa_flags?pretty=1         Human-readable JSON\n"
-        "  /health                     Cache status + row count\n"
+        "  /health                     Cache status + row count + per-GACC progress\n"
         "  /generate_normals           Start one-time normals background job\n"
         "  /normals_status?job_id=...  Poll job / download CSV\n"
     )
@@ -291,6 +331,7 @@ def health():
         cache_computed  = _CACHE["computed_at"]
         cache_composite = _CACHE["latest_composite"]
         cache_error     = _CACHE["error"]
+        gacc_progress   = dict(_CACHE["gacc_progress"])
     with JOBS_LOCK:
         active_jobs = {jid:{"status":j["status"],"message":j["message"]} for jid,j in JOBS.items()}
     return {
@@ -303,6 +344,7 @@ def health():
         "cache_computed_at":cache_computed,
         "latest_composite": cache_composite,
         "cache_error":      cache_error,
+        "gacc_progress":    gacc_progress,
         "active_jobs":      active_jobs,
     }
 
@@ -313,9 +355,9 @@ def psa_flags(
     pretty: Optional[int] = Query(0),
 ):
     with _CACHE_LOCK:
-        status = _CACHE["status"]
-        rows   = list(_CACHE["rows"])
-        latest = _CACHE["latest_composite"]
+        status   = _CACHE["status"]
+        rows     = list(_CACHE["rows"])
+        latest   = _CACHE["latest_composite"]
         computed = _CACHE["computed_at"]
 
     if status == "starting":
