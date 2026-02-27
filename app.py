@@ -216,14 +216,14 @@ def compute_latest_flags(gaccs_list: Optional[List[str]]):
     elif len(gaccs_list) >= 5:
         tile_scale = 16
     elif len(gaccs_list) >= 2:
-        tile_scale = 8
+        tile_scale = 16
     else:
-        tile_scale = 4
+        tile_scale = 16
 
     stats_fc = stack.reduceRegions(
         collection=psa_fc,
         reducer=ee.Reducer.mean(),
-        scale=30,
+        scale=90,
         tileScale=tile_scale,
     )
     stats = stats_fc.getInfo().get("features", [])
