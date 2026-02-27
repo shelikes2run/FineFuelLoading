@@ -1,4 +1,4 @@
-# app.py  v8
+# app.py  v9
 # CONUS PSA Herbaceous (HER) API — RAP 16-day provisional vs PSA normals CSV
 #
 # Env vars expected on Render:
@@ -6,14 +6,16 @@
 #   EE_PRIVATE_KEY_FILE     e.g. /etc/secrets/ee-key.json
 #   PSA_NORMALS_CSV         defaults to psa_HER_norm_CONUS_v1.csv
 #   EE_COLLECTION_16D_PROV  defaults to …npp-partitioned-16day-v3-provisional
+#   CACHE_REFRESH_HOURS     how often to refresh the cache (default 6)
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
 #
-# CHANGES v7 → v8:
-#   1. FIX: get_psa_fc() filters NONE/"No PSA Assigned" junk rows
-#   2. FIX: get_psa_fc() applies simplify(maxError=500) on geometries
-#   3. FIX: live reduceRegions uses scale=90m + tileScale=16 (was 30m/dynamic)
-#           90m = 9x fewer pixels → prevents 502 timeouts on large GACCs
+# CHANGES v8 → v9:
+#   KEY FIX: replaced synchronous getInfo() on every request with a startup
+#   cache. On boot the server computes all CONUS PSA flags in a background
+#   thread and stores the result in memory. Every /psa_flags request is served
+#   instantly from cache — no GEE call on the request path, no 502 possible.
+#   Cache refreshes every CACHE_REFRESH_HOURS (default 6).
 
 from __future__ import annotations
 import io, json, os, threading, time, uuid, datetime
@@ -39,19 +41,33 @@ EE_COLLECTION_16D_ARCH = os.getenv(
     "EE_COLLECTION_16D_ARCH",
     "projects/rap-data-365417/assets/npp-partitioned-16day-v3",
 )
-EE_SERVICE_ACCOUNT  = os.getenv("EE_SERVICE_ACCOUNT",  "").strip()
-EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
-NORMALS_CSV         = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
-HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
+EE_SERVICE_ACCOUNT   = os.getenv("EE_SERVICE_ACCOUNT",  "").strip()
+EE_PRIVATE_KEY_FILE  = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
+NORMALS_CSV          = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
+HTTP_TIMEOUT_SEC     = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
+CACHE_REFRESH_HOURS  = float(os.getenv("CACHE_REFRESH_HOURS", "6"))
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="CONUS PSA Herbaceous API", version="8.0.0")
+app = FastAPI(title="CONUS PSA Herbaceous API", version="9.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+# ── In-memory cache ───────────────────────────────────────────────────────────
+# Holds the full CONUS result as a list of row dicts.
+# Served instantly on every /psa_flags request — no GEE call on request path.
+_CACHE: dict = {
+    "rows":             [],       # list of PSA row dicts (all CONUS)
+    "latest_composite": None,     # e.g. "2026-01-17"
+    "computed_at":      None,     # datetime of last successful compute
+    "status":           "starting", # "starting" | "ready" | "error"
+    "error":            None,
+}
+_CACHE_LOCK = threading.Lock()
+
+# Separate job store for /generate_normals
 JOBS: dict = {}
 JOBS_LOCK = threading.Lock()
 
@@ -60,14 +76,12 @@ def safe_num(v):
     try:
         if v is None: return None
         f = float(v)
-        if f != f or f in (float("inf"), float("-inf")): return None
-        return f
+        return None if (f != f or f in (float("inf"), float("-inf"))) else f
     except Exception: return None
 
 def parse_gaccs_param(gaccs_raw: Optional[str]) -> Optional[List[str]]:
     if not gaccs_raw: return None
-    vals = [s.strip().upper() for s in gaccs_raw.split(",") if s.strip()]
-    return vals or None
+    return [s.strip().upper() for s in gaccs_raw.split(",") if s.strip()] or None
 
 def is_junk_psa(psa_code: str) -> bool:
     c = str(psa_code).strip().upper()
@@ -78,14 +92,16 @@ def load_normals(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Normals CSV not found: {path}")
     df = pd.read_csv(path)
-    required = ["PSANationalCode","PSANAME","GACCUnitID","afgNPP_norm","pfgNPP_norm","HER_norm"]
+    required = ["PSANationalCode","PSANAME","GACCUnitID",
+                "afgNPP_norm","pfgNPP_norm","HER_norm"]
     for col in required:
         if col not in df.columns:
             raise ValueError(f"Normals CSV missing column: {col}")
     df = df[df["PSANationalCode"].notna()]
     df = df[~df["PSANationalCode"].astype(str).apply(is_junk_psa)]
     df["PSA_KEY"] = df["PSANationalCode"].astype(str).str.upper().str.strip()
-    return df[["PSA_KEY","PSANationalCode","PSANAME","GACCUnitID","afgNPP_norm","pfgNPP_norm","HER_norm"]]
+    return df[["PSA_KEY","PSANationalCode","PSANAME","GACCUnitID",
+               "afgNPP_norm","pfgNPP_norm","HER_norm"]]
 
 # ── Init EE ───────────────────────────────────────────────────────────────────
 EE_READY = False
@@ -107,7 +123,7 @@ except Exception as e:
     print("Normals load failed:", e)
 
 # ── Fetch PSA polygons ────────────────────────────────────────────────────────
-def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
+def get_psa_fc(gaccs: Optional[List[str]] = None) -> ee.FeatureCollection:
     where = "1=1"
     if gaccs:
         quoted = ",".join([f"'{g}'" for g in gaccs])
@@ -147,80 +163,186 @@ def get_psa_fc(gaccs: Optional[List[str]]) -> ee.FeatureCollection:
         }))
     return ee.FeatureCollection(ee_feats)
 
-# ── Compute latest flags ──────────────────────────────────────────────────────
-def compute_latest_flags(gaccs_list: Optional[List[str]]):
-    if not EE_READY:
-        raise HTTPException(status_code=500, detail="Earth Engine not initialized.")
-    if NORMALS_DF is None or NORMALS_DF.empty:
-        raise HTTPException(status_code=500, detail="Normals table not loaded.")
+# ── Core compute (runs in background thread only) ─────────────────────────────
+def _compute_all_conus():
+    """
+    Fetches the latest provisional composite, runs reduceRegions for all
+    CONUS PSAs, merges with normals, and stores results in _CACHE.
+    Called at startup and every CACHE_REFRESH_HOURS thereafter.
+    Never called on the HTTP request path — no 502 risk.
+    """
+    print("Cache: starting CONUS computation ...")
+    try:
+        if not EE_READY:
+            raise RuntimeError("Earth Engine not initialized")
+        if NORMALS_DF is None or NORMALS_DF.empty:
+            raise RuntimeError("Normals table not loaded")
 
-    coll        = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
-    latest      = coll.first()
-    latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+        coll        = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
+        latest      = coll.first()
+        latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
+        print(f"Cache: latest composite = {latest_date}")
 
-    img   = latest.select(["afgNPP", "pfgNPP"])
-    her   = img.select("afgNPP").add(img.select("pfgNPP")).rename("HER")
-    stack = img.addBands(her)
+        img   = latest.select(["afgNPP","pfgNPP"])
+        her   = img.select("afgNPP").add(img.select("pfgNPP")).rename("HER")
+        stack = img.addBands(her)
 
-    psa_fc = get_psa_fc(gaccs_list)
+        psa_fc = get_psa_fc(None)   # all CONUS
 
-    # FIX: scale=90m (was 30m) — 9x fewer pixels, prevents 502 on large GACCs
-    # tileScale=16 for all queries
-    stats_fc = stack.reduceRegions(
-        collection=psa_fc,
-        reducer=ee.Reducer.mean(),
-        scale=90,
-        tileScale=16,
+        stats_fc = stack.reduceRegions(
+            collection=psa_fc,
+            reducer=ee.Reducer.mean(),
+            scale=90,
+            tileScale=16,
+        )
+        stats = stats_fc.getInfo().get("features", [])
+        print(f"Cache: {len(stats)} PSA results from GEE")
+
+        latest_rows = []
+        for f in stats:
+            p = f.get("properties", {}) or {}
+            latest_rows.append({
+                "PSA_KEY":         p.get("PSA_KEY"),
+                "PSANationalCode": p.get("PSANationalCode"),
+                "PSANAME":         p.get("PSANAME"),
+                "GACCUnitID":      p.get("GACCUnitID"),
+                "afgNPP_latest":   safe_num(p.get("afgNPP")),
+                "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
+                "HER_latest":      safe_num(p.get("HER")),
+            })
+        latest_df = pd.DataFrame(latest_rows)
+        merged    = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("","_norms"))
+
+        merged["above_normal"] = pd.NA
+        valid = merged["HER_latest"].notna() & merged["HER_norm"].notna()
+        merged.loc[valid, "above_normal"] = (
+            merged.loc[valid, "HER_latest"] > merged.loc[valid, "HER_norm"]
+        ).astype(int)
+
+        rows = []
+        for _, r in merged.iterrows():
+            an = r.get("above_normal")
+            rows.append({
+                "PSA":           r.get("PSANationalCode"),
+                "PSANAME":       r.get("PSANAME"),
+                "GACCUnitID":    r.get("GACCUnitID"),
+                "afgNPP_latest": safe_num(r.get("afgNPP_latest")),
+                "pfgNPP_latest": safe_num(r.get("pfgNPP_latest")),
+                "HER_latest":    safe_num(r.get("HER_latest")),
+                "afgNPP_norm":   safe_num(r.get("afgNPP_norm")),
+                "pfgNPP_norm":   safe_num(r.get("pfgNPP_norm")),
+                "HER_norm":      safe_num(r.get("HER_norm")),
+                "above_normal":  int(an) if pd.notna(an) else None,
+            })
+
+        with _CACHE_LOCK:
+            _CACHE["rows"]             = rows
+            _CACHE["latest_composite"] = latest_date
+            _CACHE["computed_at"]      = datetime.datetime.utcnow().isoformat() + "Z"
+            _CACHE["status"]           = "ready"
+            _CACHE["error"]            = None
+
+        print(f"Cache: ready — {len(rows)} PSA rows stored")
+
+    except Exception as exc:
+        print(f"Cache: compute failed — {exc}")
+        with _CACHE_LOCK:
+            _CACHE["status"] = "error"
+            _CACHE["error"]  = str(exc)
+
+
+def _cache_refresh_loop():
+    """Background thread: compute once at startup, then refresh every N hours."""
+    while True:
+        _compute_all_conus()
+        sleep_secs = CACHE_REFRESH_HOURS * 3600
+        print(f"Cache: next refresh in {CACHE_REFRESH_HOURS}h")
+        time.sleep(sleep_secs)
+
+
+# Start the cache refresh loop at startup
+if EE_READY and NORMALS_DF is not None:
+    t = threading.Thread(target=_cache_refresh_loop, daemon=True)
+    t.start()
+    print("Cache: background refresh thread started")
+else:
+    print("Cache: skipping background thread (EE or normals not ready)")
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/", response_class=PlainTextResponse)
+def root():
+    return (
+        "CONUS PSA Herbaceous API v9\n\n"
+        "Endpoints:\n"
+        "  /psa_flags                  All CONUS (served from cache)\n"
+        "  /psa_flags?gaccs=USCAONCC  Filter by GACC (comma-separated)\n"
+        "  /psa_flags?pretty=1         Human-readable JSON\n"
+        "  /health                     Cache status + row count\n"
+        "  /generate_normals           Start one-time normals background job\n"
+        "  /normals_status?job_id=...  Poll job / download CSV\n"
     )
-    stats = stats_fc.getInfo().get("features", [])
 
-    latest_rows = []
-    for f in stats:
-        p = f.get("properties", {}) or {}
-        latest_rows.append({
-            "PSA_KEY":         p.get("PSA_KEY"),
-            "PSANationalCode": p.get("PSANationalCode"),
-            "PSANAME":         p.get("PSANAME"),
-            "GACCUnitID":      p.get("GACCUnitID"),
-            "afgNPP_latest":   safe_num(p.get("afgNPP")),
-            "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
-            "HER_latest":      safe_num(p.get("HER")),
-        })
-    latest_df = pd.DataFrame(latest_rows)
 
-    if latest_df.empty:
-        return {"count":0,"gaccs":gaccs_list or [],"collection":EE_COLLECTION_16D_PROV,"latest_composite":latest_date,"rows":[]}
-
-    merged = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("","_norms"))
-    merged["above_normal"] = pd.NA
-    valid = merged["HER_latest"].notna() & merged["HER_norm"].notna()
-    merged.loc[valid, "above_normal"] = (
-        merged.loc[valid, "HER_latest"] > merged.loc[valid, "HER_norm"]
-    ).astype(int)
-
-    result_gaccs = sorted(merged["GACCUnitID"].dropna().unique().tolist())
-    out = []
-    for _, r in merged.iterrows():
-        an = r.get("above_normal")
-        out.append({
-            "PSA":           r.get("PSANationalCode"),
-            "PSANAME":       r.get("PSANAME"),
-            "GACCUnitID":    r.get("GACCUnitID"),
-            "afgNPP_latest": safe_num(r.get("afgNPP_latest")),
-            "pfgNPP_latest": safe_num(r.get("pfgNPP_latest")),
-            "HER_latest":    safe_num(r.get("HER_latest")),
-            "afgNPP_norm":   safe_num(r.get("afgNPP_norm")),
-            "pfgNPP_norm":   safe_num(r.get("pfgNPP_norm")),
-            "HER_norm":      safe_num(r.get("HER_norm")),
-            "above_normal":  int(an) if pd.notna(an) else None,
-        })
+@app.get("/health")
+def health():
+    with _CACHE_LOCK:
+        cache_status    = _CACHE["status"]
+        cache_rows      = len(_CACHE["rows"])
+        cache_computed  = _CACHE["computed_at"]
+        cache_composite = _CACHE["latest_composite"]
+        cache_error     = _CACHE["error"]
+    with JOBS_LOCK:
+        active_jobs = {jid:{"status":j["status"],"message":j["message"]} for jid,j in JOBS.items()}
     return {
-        "count":            len(out),
-        "gaccs":            gaccs_list if gaccs_list else result_gaccs,
-        "collection":       EE_COLLECTION_16D_PROV,
-        "latest_composite": latest_date,
-        "rows":             out,
+        "status":           "ok",
+        "ee_initialized":   EE_READY,
+        "normals_csv":      NORMALS_CSV,
+        "normals_rows":     len(NORMALS_DF) if NORMALS_DF is not None else 0,
+        "cache_status":     cache_status,
+        "cache_psa_rows":   cache_rows,
+        "cache_computed_at":cache_computed,
+        "latest_composite": cache_composite,
+        "cache_error":      cache_error,
+        "active_jobs":      active_jobs,
     }
+
+
+@app.get("/psa_flags")
+def psa_flags(
+    gaccs:  Optional[str] = Query(None),
+    pretty: Optional[int] = Query(0),
+):
+    with _CACHE_LOCK:
+        status = _CACHE["status"]
+        rows   = list(_CACHE["rows"])
+        latest = _CACHE["latest_composite"]
+        computed = _CACHE["computed_at"]
+
+    if status == "starting":
+        raise HTTPException(status_code=503, detail="Cache is still computing — try again in a few minutes.")
+    if status == "error":
+        raise HTTPException(status_code=500, detail=f"Cache compute failed: {_CACHE['error']}")
+
+    # Filter by GACC if requested
+    gacc_list = parse_gaccs_param(gaccs)
+    if gacc_list:
+        rows = [r for r in rows if r.get("GACCUnitID") in gacc_list]
+
+    result_gaccs = sorted(set(r["GACCUnitID"] for r in rows if r.get("GACCUnitID")))
+
+    payload = {
+        "count":            len(rows),
+        "gaccs":            gacc_list if gacc_list else result_gaccs,
+        "collection":       EE_COLLECTION_16D_PROV,
+        "latest_composite": latest,
+        "cache_computed_at":computed,
+        "rows":             rows,
+    }
+
+    if bool(pretty):
+        return PlainTextResponse(json.dumps(payload, indent=2), media_type="application/json")
+    return JSONResponse(payload)
+
 
 # ── Background normals job ────────────────────────────────────────────────────
 def _run_generate_normals(job_id: str):
@@ -233,14 +355,14 @@ def _run_generate_normals(job_id: str):
         arch   = ee.ImageCollection(EE_COLLECTION_16D_ARCH).filterDate("1986-01-01","2025-01-01")
         n_imgs = arch.size().getInfo()
         if n_imgs == 0:
-            raise RuntimeError("No images found in archived collection")
-        _update(f"{n_imgs} composites found — computing mean")
+            raise RuntimeError("No images in archived collection")
+        _update(f"{n_imgs} composites — computing mean")
         mean_bands = arch.select(["afgNPP","pfgNPP"]).mean()
         her_band   = mean_bands.select("afgNPP").add(mean_bands.select("pfgNPP")).rename("HER")
         norm_stack = ee.Image.cat([mean_bands, her_band])
         _update("Fetching PSA polygons")
         psa_fc = get_psa_fc(None)
-        _update("Running reduceRegions (90m, tileScale=16)")
+        _update("Running reduceRegions")
         stats_fc = norm_stack.reduceRegions(collection=psa_fc, reducer=ee.Reducer.mean(), scale=90, tileScale=16)
         stats = stats_fc.getInfo().get("features", [])
         rows = []
@@ -259,27 +381,6 @@ def _run_generate_normals(job_id: str):
         with JOBS_LOCK:
             JOBS[job_id].update({"status":"error","error":str(exc),"message":f"Failed: {exc}"})
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.get("/", response_class=PlainTextResponse)
-def root():
-    return "CONUS PSA Herbaceous API v8\n\nEndpoints:\n  /psa_flags?gaccs=USCAONCC\n  /psa_flags?pretty=1\n  /health\n  /generate_normals\n  /normals_status?job_id=...\n"
-
-@app.get("/health")
-def health():
-    with JOBS_LOCK:
-        active_jobs = {jid:{"status":j["status"],"message":j["message"]} for jid,j in JOBS.items()}
-    return {"status":"ok","ee_initialized":EE_READY,"normals_csv":NORMALS_CSV,
-            "normals_rows":len(NORMALS_DF) if NORMALS_DF is not None else 0,"active_jobs":active_jobs}
-
-@app.get("/psa_flags")
-def psa_flags(gaccs: Optional[str]=Query(None), pretty: Optional[int]=Query(0)):
-    try:
-        payload = compute_latest_flags(parse_gaccs_param(gaccs))
-        if bool(pretty):
-            return PlainTextResponse(json.dumps(payload, indent=2), media_type="application/json")
-        return JSONResponse(payload)
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/generate_normals")
 def generate_normals(background_tasks: BackgroundTasks):
@@ -292,8 +393,9 @@ def generate_normals(background_tasks: BackgroundTasks):
     background_tasks.add_task(_run_generate_normals, job_id)
     return JSONResponse({"job_id":job_id,"status":"running","poll_url":f"/normals_status?job_id={job_id}"})
 
+
 @app.get("/normals_status")
-def normals_status(job_id: str=Query(...)):
+def normals_status(job_id: str = Query(...)):
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if job is None:
@@ -303,6 +405,7 @@ def normals_status(job_id: str=Query(...)):
             headers={"Content-Disposition":"attachment; filename=psa_HER_norm_CONUS_v1.csv"})
     return JSONResponse({"job_id":job_id,"status":job["status"],"started":job["started"],
                          "message":job["message"],"error":job.get("error")})
+
 
 if __name__ == "__main__":
     import uvicorn
