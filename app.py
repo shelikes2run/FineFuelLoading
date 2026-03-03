@@ -14,10 +14,6 @@
 # CHANGES v10 → v11:
 #   KEY FIX: replaced live ArcGIS geometry fetch with PSA_CONUS_lite.geojson
 #   (already in repo, 0.94MB, 98% fewer vertices than full-res ArcGIS data).
-#   Loading full-res polygons from ArcGIS at runtime was the primary cause of
-#   OOM crashes — each PSA had ~4,600 vertices being held in Python memory
-#   while constructing ee.Feature objects. The lite file has ~106 pts/PSA,
-#   cutting geometry memory by ~97%.
 #   Also added gc.collect() between GACC iterations to release memory promptly.
 
 from __future__ import annotations
