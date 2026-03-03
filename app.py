@@ -10,11 +10,6 @@
 #   CACHE_REFRESH_HOURS     how often to refresh the cache (default 6)
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
-#
-# CHANGES v10 → v11:
-#   KEY FIX: replaced live ArcGIS geometry fetch with PSA_CONUS_lite.geojson
-#   (already in repo, 0.94MB, 98% fewer vertices than full-res ArcGIS data).
-#   Also added gc.collect() between GACC iterations to release memory promptly.
 
 from __future__ import annotations
 import gc, io, json, os, threading, time, uuid, datetime
