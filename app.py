@@ -70,19 +70,16 @@ app.add_middleware(
 )
 
 # ── In-memory cache ───────────────────────────────────────────────────────────
-# Holds the full CONUS result as a list of row dicts.
-# Served instantly on every /psa_flags request — no GEE call on request path.
 _CACHE: dict = {
-    "rows":             [],       # list of PSA row dicts (all CONUS)
-    "latest_composite": None,     # e.g. "2026-01-17"
-    "computed_at":      None,     # datetime of last successful compute
-    "status":           "starting", # "starting" | "ready" | "error"
+    "rows":             [],
+    "latest_composite": None,
+    "computed_at":      None,
+    "status":           "starting",
     "error":            None,
-    "gacc_progress":    {},       # per-GACC status for diagnostics
+    "gacc_progress":    {},
 }
 _CACHE_LOCK = threading.Lock()
 
-# Separate job store for /generate_normals
 JOBS: dict = {}
 JOBS_LOCK = threading.Lock()
 
@@ -137,7 +134,7 @@ try:
 except Exception as e:
     print("Normals load failed:", e)
 
-# ── Fetch PSA polygons for a single GACC ─────────────────────────────────────
+# ── Fetch PSA polygons ────────────────────────────────────────────────────────
 def get_psa_fc(gaccs: Optional[List[str]] = None) -> ee.FeatureCollection:
     where = "1=1"
     if gaccs:
@@ -178,14 +175,8 @@ def get_psa_fc(gaccs: Optional[List[str]] = None) -> ee.FeatureCollection:
         }))
     return ee.FeatureCollection(ee_feats)
 
-# ── Core compute (runs in background thread only) ─────────────────────────────
+# ── Core compute (background thread only) ────────────────────────────────────
 def _compute_all_conus():
-    """
-    Processes one GACC at a time to keep peak memory low.
-    Results are accumulated incrementally and stored in _CACHE when all done.
-    If a single GACC fails, the rest still complete.
-    Never called on the HTTP request path — no 502 risk.
-    """
     print("Cache: starting CONUS computation (per-GACC batching) ...")
     try:
         if not EE_READY:
@@ -193,7 +184,6 @@ def _compute_all_conus():
         if NORMALS_DF is None or NORMALS_DF.empty:
             raise RuntimeError("Normals table not loaded")
 
-        # Resolve latest composite date once (lightweight call)
         coll        = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
         latest      = coll.first()
         latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
@@ -209,8 +199,8 @@ def _compute_all_conus():
         for gacc in GACC_CODES:
             print(f"Cache: processing {gacc} ...")
             try:
-                psa_fc   = get_psa_fc([gacc])
-                fc_size  = psa_fc.size().getInfo()
+                psa_fc  = get_psa_fc([gacc])
+                fc_size = psa_fc.size().getInfo()
 
                 if fc_size == 0:
                     print(f"Cache: {gacc} — 0 valid PSAs, skipping")
@@ -242,10 +232,8 @@ def _compute_all_conus():
             except Exception as gacc_exc:
                 print(f"Cache: {gacc} failed — {gacc_exc}")
                 gacc_progress[gacc] = {"status": "error", "error": str(gacc_exc)}
-                # continue to next GACC — don't abort entire run
                 continue
 
-        # Merge with normals
         latest_df = pd.DataFrame(all_latest_rows)
         if latest_df.empty:
             raise RuntimeError("No PSA results returned from any GACC")
@@ -292,7 +280,6 @@ def _compute_all_conus():
 
 
 def _cache_refresh_loop():
-    """Background thread: compute once at startup, then refresh every N hours."""
     while True:
         _compute_all_conus()
         sleep_secs = CACHE_REFRESH_HOURS * 3600
@@ -300,7 +287,6 @@ def _cache_refresh_loop():
         time.sleep(sleep_secs)
 
 
-# Start the cache refresh loop at startup
 if EE_READY and NORMALS_DF is not None:
     t = threading.Thread(target=_cache_refresh_loop, daemon=True)
     t.start()
@@ -365,7 +351,6 @@ def psa_flags(
     if status == "error":
         raise HTTPException(status_code=500, detail=f"Cache compute failed: {_CACHE['error']}")
 
-    # Filter by GACC if requested
     gacc_list = parse_gaccs_param(gaccs)
     if gacc_list:
         rows = [r for r in rows if r.get("GACCUnitID") in gacc_list]
