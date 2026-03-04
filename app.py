@@ -1,4 +1,4 @@
-# app.py  v11
+# app.py  v12
 # CONUS PSA Herbaceous (HER) API — RAP 16-day provisional vs PSA normals CSV
 #
 # Env vars expected on Render:
@@ -8,61 +8,48 @@
 #   PSA_LITE_GEOJSON        defaults to PSA_CONUS_lite.geojson
 #   EE_COLLECTION_16D_PROV  defaults to …npp-partitioned-16day-v3-provisional
 #   CACHE_REFRESH_HOURS     how often to refresh the cache (default 6)
+#   SUB_BATCH_SIZE          PSAs per reduceRegions call (default 15)
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
 #
-# CHANGES v10 → v11:
-#   KEY FIX: replaced live ArcGIS geometry fetch with PSA_CONUS_lite.geojson
-#   (already in repo, 0.94MB, 98% fewer vertices than full-res ArcGIS data).
-#   Loading full-res polygons from ArcGIS at runtime was the primary cause of
-#   OOM crashes — each PSA had ~4,600 vertices being held in Python memory
-#   while constructing ee.Feature objects. The lite file has ~106 pts/PSA,
-#   cutting geometry memory by ~97%.
-#   Also added gc.collect() between GACC iterations to release memory promptly.
+# CHANGES v11 → v12:
+#   KEY FIX: sub-batch each GACC into groups of SUB_BATCH_SIZE PSAs (default 15).
+#   USGASAC has 56 PSAs — processing all at once caused a GEE computation timeout.
+#   Sub-batching into 4 groups of ~14 PSAs each stays well within GEE limits.
+#   All other GACCs (≤35 PSAs) are also sub-batched for consistency.
+#   Partial failures are handled gracefully — if one sub-batch fails the others
+#   still complete and results are merged.
 
 from __future__ import annotations
-import gc, io, json, os, threading, time, uuid, datetime
+import gc, json, os, threading, time, datetime
 from typing import List, Optional
 
 import pandas as pd
-import requests
 import ee
-from fastapi import FastAPI, Query, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PSA_LITE_GEOJSON     = os.getenv("PSA_LITE_GEOJSON", "PSA_CONUS_lite.geojson")
+PSA_LITE_GEOJSON       = os.getenv("PSA_LITE_GEOJSON", "PSA_CONUS_lite.geojson")
 EE_COLLECTION_16D_PROV = os.getenv(
     "EE_COLLECTION_16D_PROV",
     "projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional",
 )
-EE_COLLECTION_16D_ARCH = os.getenv(
-    "EE_COLLECTION_16D_ARCH",
-    "projects/rap-data-365417/assets/npp-partitioned-16day-v3",
-)
-EE_SERVICE_ACCOUNT   = os.getenv("EE_SERVICE_ACCOUNT",  "").strip()
-EE_PRIVATE_KEY_FILE  = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
-NORMALS_CSV          = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
-HTTP_TIMEOUT_SEC     = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
-CACHE_REFRESH_HOURS  = float(os.getenv("CACHE_REFRESH_HOURS", "6"))
+EE_SERVICE_ACCOUNT  = os.getenv("EE_SERVICE_ACCOUNT",  "").strip()
+EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
+NORMALS_CSV         = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
+HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
+CACHE_REFRESH_HOURS = float(os.getenv("CACHE_REFRESH_HOURS", "6"))
+SUB_BATCH_SIZE      = int(os.getenv("SUB_BATCH_SIZE", "15"))  # PSAs per GEE call
 
-# All CONUS GACCs — processed one at a time to keep memory low
 GACC_CODES = [
-    "USAKACC",
-    "USCAONCC",
-    "USCAOSCC",
-    "USCORMC",
-    "USGASAC",
-    "USMTNRC",
-    "USNMSWC",
-    "USORNWC",
-    "USUTGBC",
-    "USWIEACC",
+    "USAKACC", "USCAONCC", "USCAOSCC", "USCORMC", "USGASAC",
+    "USMTNRC", "USNMSWC", "USORNWC", "USUTGBC", "USWIEACC",
 ]
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="CONUS PSA Herbaceous API", version="11.0.0")
+app = FastAPI(title="CONUS PSA Herbaceous API", version="12.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -71,17 +58,10 @@ app.add_middleware(
 
 # ── In-memory cache ───────────────────────────────────────────────────────────
 _CACHE: dict = {
-    "rows":             [],
-    "latest_composite": None,
-    "computed_at":      None,
-    "status":           "starting",
-    "error":            None,
-    "gacc_progress":    {},
+    "rows": [], "latest_composite": None, "computed_at": None,
+    "status": "starting", "error": None, "gacc_progress": {},
 }
 _CACHE_LOCK = threading.Lock()
-
-JOBS: dict = {}
-JOBS_LOCK = threading.Lock()
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def safe_num(v):
@@ -104,8 +84,7 @@ def load_normals(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Normals CSV not found: {path}")
     df = pd.read_csv(path)
-    required = ["PSANationalCode","PSANAME","GACCUnitID",
-                "afgNPP_norm","pfgNPP_norm","HER_norm"]
+    required = ["PSANationalCode","PSANAME","GACCUnitID","afgNPP_norm","pfgNPP_norm","HER_norm"]
     for col in required:
         if col not in df.columns:
             raise ValueError(f"Normals CSV missing column: {col}")
@@ -115,52 +94,36 @@ def load_normals(path: str) -> pd.DataFrame:
     return df[["PSA_KEY","PSANationalCode","PSANAME","GACCUnitID",
                "afgNPP_norm","pfgNPP_norm","HER_norm"]]
 
-# ── Load lite PSA GeoJSON (done once at startup) ──────────────────────────────
-# PSA_CONUS_lite.geojson is pre-simplified (106 pts/PSA vs 4,600 in ArcGIS).
-# Using this instead of live ArcGIS fetches cuts geometry memory by ~97%.
+# ── Load lite PSA GeoJSON (once at startup) ───────────────────────────────────
 def load_lite_geojson(path: str) -> list:
-    """Return list of GeoJSON feature dicts from the lite file."""
     if not os.path.exists(path):
         raise FileNotFoundError(f"Lite GeoJSON not found: {path}")
     with open(path, "r") as f:
         gj = json.load(f)
-    features = gj.get("features", [])
-    # Filter junk rows
     clean = []
-    for feat in features:
-        props = feat.get("properties", {}) or {}
+    for feat in gj.get("features", []):
+        props    = feat.get("properties", {}) or {}
         psa_code = str(props.get("PSANationalCode", props.get("PSA_NAT_CODE", ""))).strip()
         if feat.get("geometry") and not is_junk_psa(psa_code):
             clean.append(feat)
     print(f"Lite GeoJSON: {len(clean)} valid PSA features loaded from {path}")
     return clean
 
-# ── Build ee.FeatureCollection from lite features for one GACC ───────────────
-def get_psa_fc_from_lite(lite_features: list, gacc: Optional[str] = None) -> ee.FeatureCollection:
-    """
-    Build an ee.FeatureCollection from pre-loaded lite GeoJSON features.
-    Optionally filter to a single GACC. Geometries are already simplified
-    (~106 pts/PSA) so no further simplify() call is needed.
-    """
+# ── Build ee.FeatureCollection from a list of lite features ──────────────────
+def build_ee_fc(feature_list: list) -> ee.FeatureCollection:
     ee_feats = []
-    for f in lite_features:
+    for f in feature_list:
         props    = f.get("properties", {}) or {}
         geom     = f.get("geometry")
         psa_code = str(props.get("PSANationalCode", props.get("PSA_NAT_CODE", ""))).strip()
         gacc_id  = str(props.get("GACCUnitID", props.get("GACC", ""))).strip()
         psaname  = props.get("PSANAME", props.get("PSA_NAME", ""))
-
         if not geom or is_junk_psa(psa_code):
             continue
-        if gacc and gacc_id != gacc:
-            continue
-
         psa_key = psa_code.upper()
         ee_feats.append(ee.Feature(ee.Geometry(geom), {
-            "PSA_KEY":         psa_key,
-            "PSANationalCode": psa_key,
-            "PSANAME":         psaname,
-            "GACCUnitID":      gacc_id,
+            "PSA_KEY": psa_key, "PSANationalCode": psa_key,
+            "PSANAME": psaname, "GACCUnitID": gacc_id,
         }))
     return ee.FeatureCollection(ee_feats)
 
@@ -192,11 +155,12 @@ except Exception as e:
 # ── Core compute (background thread only) ────────────────────────────────────
 def _compute_all_conus():
     """
-    Processes one GACC at a time using pre-loaded lite geometries.
-    Peak memory stays low; gc.collect() between GACCs releases objects promptly.
-    Never called on the HTTP request path — no 502 risk.
+    For each GACC, splits PSAs into sub-batches of SUB_BATCH_SIZE (default 15)
+    and runs a separate reduceRegions call per batch. This keeps each GEE call
+    small enough to complete within the computation timeout — critical for large
+    GACCs like USGASAC (56 PSAs → 4 batches of ~14).
     """
-    print("Cache: starting CONUS computation (lite geojson + per-GACC) ...")
+    print(f"Cache: starting CONUS computation (sub_batch={SUB_BATCH_SIZE}) ...")
     try:
         if not EE_READY:
             raise RuntimeError("Earth Engine not initialized")
@@ -219,51 +183,76 @@ def _compute_all_conus():
 
         for gacc in GACC_CODES:
             print(f"Cache: processing {gacc} ...")
-            try:
-                psa_fc  = get_psa_fc_from_lite(LITE_FEATURES, gacc=gacc)
-                fc_size = psa_fc.size().getInfo()
 
-                if fc_size == 0:
-                    print(f"Cache: {gacc} — 0 valid PSAs, skipping")
-                    gacc_progress[gacc] = {"status": "skipped", "psas": 0}
-                    continue
+            # Collect all lite features for this GACC
+            gacc_features = [
+                f for f in LITE_FEATURES
+                if str((f.get("properties") or {}).get("GACCUnitID", "")).strip() == gacc
+            ]
 
-                stats_fc = stack.reduceRegions(
-                    collection=psa_fc,
-                    reducer=ee.Reducer.mean(),
-                    scale=90,
-                    tileScale=16,
-                )
-                stats = stats_fc.getInfo().get("features", [])
-                print(f"Cache: {gacc} — {len(stats)} results")
+            if not gacc_features:
+                print(f"Cache: {gacc} — 0 features in lite GeoJSON, skipping")
+                gacc_progress[gacc] = {"status": "skipped", "psas": 0}
+                continue
 
-                for f in stats:
-                    p = f.get("properties", {}) or {}
-                    all_latest_rows.append({
-                        "PSA_KEY":         p.get("PSA_KEY"),
-                        "PSANationalCode": p.get("PSANationalCode"),
-                        "PSANAME":         p.get("PSANAME"),
-                        "GACCUnitID":      p.get("GACCUnitID"),
-                        "afgNPP_latest":   safe_num(p.get("afgNPP")),
-                        "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
-                        "HER_latest":      safe_num(p.get("HER")),
-                    })
-                gacc_progress[gacc] = {"status": "ok", "psas": len(stats)}
+            # Split into sub-batches
+            batches = [
+                gacc_features[i:i + SUB_BATCH_SIZE]
+                for i in range(0, len(gacc_features), SUB_BATCH_SIZE)
+            ]
+            print(f"Cache: {gacc} — {len(gacc_features)} PSAs in {len(batches)} batch(es)")
 
-            except Exception as gacc_exc:
-                print(f"Cache: {gacc} failed — {gacc_exc}")
-                gacc_progress[gacc] = {"status": "error", "error": str(gacc_exc)}
+            gacc_rows   = []
+            batch_errors = []
 
-            finally:
-                # Force GC between GACCs to release ee.Feature objects promptly
-                gc.collect()
+            for batch_idx, batch in enumerate(batches):
+                try:
+                    psa_fc   = build_ee_fc(batch)
+                    stats_fc = stack.reduceRegions(
+                        collection=psa_fc,
+                        reducer=ee.Reducer.mean(),
+                        scale=90,
+                        tileScale=16,
+                    )
+                    stats = stats_fc.getInfo().get("features", [])
+                    print(f"Cache: {gacc} batch {batch_idx+1}/{len(batches)} — {len(stats)} results")
 
+                    for f in stats:
+                        p = f.get("properties", {}) or {}
+                        gacc_rows.append({
+                            "PSA_KEY":         p.get("PSA_KEY"),
+                            "PSANationalCode": p.get("PSANationalCode"),
+                            "PSANAME":         p.get("PSANAME"),
+                            "GACCUnitID":      p.get("GACCUnitID"),
+                            "afgNPP_latest":   safe_num(p.get("afgNPP")),
+                            "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
+                            "HER_latest":      safe_num(p.get("HER")),
+                        })
+
+                except Exception as batch_exc:
+                    print(f"Cache: {gacc} batch {batch_idx+1} failed — {batch_exc}")
+                    batch_errors.append(f"batch {batch_idx+1}: {batch_exc}")
+
+                finally:
+                    gc.collect()
+
+            all_latest_rows.extend(gacc_rows)
+
+            if batch_errors:
+                gacc_progress[gacc] = {
+                    "status":  "partial" if gacc_rows else "error",
+                    "psas":    len(gacc_rows),
+                    "errors":  batch_errors,
+                }
+            else:
+                gacc_progress[gacc] = {"status": "ok", "psas": len(gacc_rows)}
+
+        # ── Merge with normals ────────────────────────────────────────────────
         latest_df = pd.DataFrame(all_latest_rows)
         if latest_df.empty:
             raise RuntimeError("No PSA results returned from any GACC")
 
         merged = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("","_norms"))
-
         merged["above_normal"] = pd.NA
         valid = merged["HER_latest"].notna() & merged["HER_norm"].notna()
         merged.loc[valid, "above_normal"] = (
@@ -306,9 +295,8 @@ def _compute_all_conus():
 def _cache_refresh_loop():
     while True:
         _compute_all_conus()
-        sleep_secs = CACHE_REFRESH_HOURS * 3600
         print(f"Cache: next refresh in {CACHE_REFRESH_HOURS}h")
-        time.sleep(sleep_secs)
+        time.sleep(CACHE_REFRESH_HOURS * 3600)
 
 
 if EE_READY and NORMALS_DF is not None and LITE_FEATURES:
@@ -322,12 +310,12 @@ else:
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
-        "CONUS PSA Herbaceous API v11\n\n"
+        "CONUS PSA Herbaceous API v12\n\n"
         "Endpoints:\n"
         "  /psa_flags                  All CONUS (served from cache)\n"
         "  /psa_flags?gaccs=USCAONCC  Filter by GACC (comma-separated)\n"
         "  /psa_flags?pretty=1         Human-readable JSON\n"
-        "  /health                     Cache status + row count + per-GACC progress\n"
+        "  /health                     Cache status + per-GACC progress\n"
     )
 
 
@@ -340,22 +328,20 @@ def health():
         cache_composite = _CACHE["latest_composite"]
         cache_error     = _CACHE["error"]
         gacc_progress   = dict(_CACHE["gacc_progress"])
-    with JOBS_LOCK:
-        active_jobs = {jid:{"status":j["status"],"message":j["message"]} for jid,j in JOBS.items()}
     return {
-        "status":           "ok",
-        "ee_initialized":   EE_READY,
-        "normals_csv":      NORMALS_CSV,
-        "normals_rows":     len(NORMALS_DF) if NORMALS_DF is not None else 0,
-        "lite_geojson":     PSA_LITE_GEOJSON,
-        "lite_features":    len(LITE_FEATURES),
-        "cache_status":     cache_status,
-        "cache_psa_rows":   cache_rows,
-        "cache_computed_at":cache_computed,
-        "latest_composite": cache_composite,
-        "cache_error":      cache_error,
-        "gacc_progress":    gacc_progress,
-        "active_jobs":      active_jobs,
+        "status":            "ok",
+        "ee_initialized":    EE_READY,
+        "normals_csv":       NORMALS_CSV,
+        "normals_rows":      len(NORMALS_DF) if NORMALS_DF is not None else 0,
+        "lite_geojson":      PSA_LITE_GEOJSON,
+        "lite_features":     len(LITE_FEATURES),
+        "sub_batch_size":    SUB_BATCH_SIZE,
+        "cache_status":      cache_status,
+        "cache_psa_rows":    cache_rows,
+        "cache_computed_at": cache_computed,
+        "latest_composite":  cache_composite,
+        "cache_error":       cache_error,
+        "gacc_progress":     gacc_progress,
     }
 
 
@@ -380,7 +366,6 @@ def psa_flags(
         rows = [r for r in rows if r.get("GACCUnitID") in gacc_list]
 
     result_gaccs = sorted(set(r["GACCUnitID"] for r in rows if r.get("GACCUnitID")))
-
     payload = {
         "count":            len(rows),
         "gaccs":            gacc_list if gacc_list else result_gaccs,
