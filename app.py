@@ -1,55 +1,49 @@
-# app.py  v12
-# CONUS PSA Herbaceous (HER) API — RAP 16-day provisional vs PSA normals CSV
+# app.py  v14
+# California PSA Herbaceous (HER) API — RAP public API vs PSA normals CSV
+#
+# NO GOOGLE EARTH ENGINE REQUIRED — uses RAP's free public API directly.
 #
 # Env vars expected on Render:
-#   EE_SERVICE_ACCOUNT      e.g. finefuel@finefuelloading.iam.gserviceaccount.com
-#   EE_PRIVATE_KEY_FILE     e.g. /etc/secrets/ee-key.json
-#   PSA_NORMALS_CSV         defaults to psa_HER_norm_CONUS_v1.csv
+#   PSA_NORMALS_CSV         defaults to psa_HER_norm_CA_v2.csv
 #   PSA_LITE_GEOJSON        defaults to PSA_CONUS_lite.geojson
-#   EE_COLLECTION_16D_PROV  defaults to …npp-partitioned-16day-v3-provisional
 #   CACHE_REFRESH_HOURS     how often to refresh the cache (default 6)
-#   SUB_BATCH_SIZE          PSAs per reduceRegions call (default 15)
+#   RAP_REQUEST_DELAY_SEC   delay between RAP API calls (default 0.5)
 #   HTTP_TIMEOUT_SEC        defaults to 60
 #   CORS_ALLOW_ORIGINS      defaults to "*"
 #
-# CHANGES v11 → v12:
-#   KEY FIX: sub-batch each GACC into groups of SUB_BATCH_SIZE PSAs (default 15).
-#   USGASAC has 56 PSAs — processing all at once caused a GEE computation timeout.
-#   Sub-batching into 4 groups of ~14 PSAs each stays well within GEE limits.
-#   All other GACCs (≤35 PSAs) are also sub-batched for consistency.
-#   Partial failures are handled gracefully — if one sub-batch fails the others
-#   still complete and results are merged.
+# CHANGES v13 → v14:
+#   Removed Google Earth Engine entirely. Now calls the RAP public API:
+#   POST https://us-central1-rap-data-365417.cloudfunctions.net/production16dayV3
+#   This endpoint accepts a GeoJSON polygon and returns 16-day AFG/PFG/HER
+#   production values (lbs/acre). No credentials or account required.
+#   Normals CSV must be regenerated using the companion notebook
+#   (generate_normals_RAP_API.ipynb) which uses the same API and units.
 
 from __future__ import annotations
 import gc, json, os, threading, time, datetime
 from typing import List, Optional
 
 import pandas as pd
-import ee
+import requests
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PSA_LITE_GEOJSON       = os.getenv("PSA_LITE_GEOJSON", "PSA_CONUS_lite.geojson")
-EE_COLLECTION_16D_PROV = os.getenv(
-    "EE_COLLECTION_16D_PROV",
-    "projects/rap-data-365417/assets/npp-partitioned-16day-v3-provisional",
-)
-EE_SERVICE_ACCOUNT  = os.getenv("EE_SERVICE_ACCOUNT",  "").strip()
-EE_PRIVATE_KEY_FILE = os.getenv("EE_PRIVATE_KEY_FILE", "").strip()
-NORMALS_CSV         = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CONUS_v1.csv")
-HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
-CACHE_REFRESH_HOURS = float(os.getenv("CACHE_REFRESH_HOURS", "6"))
-SUB_BATCH_SIZE      = int(os.getenv("SUB_BATCH_SIZE", "15"))  # PSAs per GEE call
+RAP_16DAY_URL    = "https://us-central1-rap-data-365417.cloudfunctions.net/production16dayV3"
+PSA_LITE_GEOJSON = os.getenv("PSA_LITE_GEOJSON", "PSA_CONUS_lite.geojson")
+NORMALS_CSV      = os.getenv("PSA_NORMALS_CSV", "psa_HER_norm_CA_v2.csv")
+HTTP_TIMEOUT_SEC = int(os.getenv("HTTP_TIMEOUT_SEC", "60"))
+CACHE_REFRESH_HOURS  = float(os.getenv("CACHE_REFRESH_HOURS", "6"))
+RAP_REQUEST_DELAY    = float(os.getenv("RAP_REQUEST_DELAY_SEC", "0.5"))
 
 GACC_CODES = [
-    "USAKACC", "USCAONCC", "USCAOSCC", "USCORMC", "USGASAC",
-    "USMTNRC", "USNMSWC", "USORNWC", "USUTGBC", "USWIEACC",
+    "USCAONCC",  # California North
+    "USCAOSCC",  # California South
 ]
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-app = FastAPI(title="CONUS PSA Herbaceous API", version="12.0.0")
+app = FastAPI(title="California PSA Herbaceous API", version="14.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
@@ -109,36 +103,62 @@ def load_lite_geojson(path: str) -> list:
     print(f"Lite GeoJSON: {len(clean)} valid PSA features loaded from {path}")
     return clean
 
-# ── Build ee.FeatureCollection from a list of lite features ──────────────────
-def build_ee_fc(feature_list: list) -> ee.FeatureCollection:
-    ee_feats = []
-    for f in feature_list:
-        props    = f.get("properties", {}) or {}
-        geom     = f.get("geometry")
-        psa_code = str(props.get("PSANationalCode", props.get("PSA_NAT_CODE", ""))).strip()
-        gacc_id  = str(props.get("GACCUnitID", props.get("GACC", ""))).strip()
-        psaname  = props.get("PSANAME", props.get("PSA_NAME", ""))
-        if not geom or is_junk_psa(psa_code):
-            continue
-        psa_key = psa_code.upper()
-        ee_feats.append(ee.Feature(ee.Geometry(geom), {
-            "PSA_KEY": psa_key, "PSANationalCode": psa_key,
-            "PSANAME": psaname, "GACCUnitID": gacc_id,
-        }))
-    return ee.FeatureCollection(ee_feats)
+# ── RAP public API call ───────────────────────────────────────────────────────
+def fetch_rap_16day(geometry: dict, year: Optional[int] = None) -> list:
+    """
+    POST a GeoJSON polygon to the RAP production16dayV3 endpoint.
+    Returns a list of rows: [date, year, doy, AFG, PFG, HER]
+    The first row is the header. Subsequent rows are data.
+    No credentials required — fully public API.
+    """
+    payload = {
+        "type": "Feature",
+        "geometry": geometry,
+        "properties": {"mask": True, "year": year},
+    }
+    r = requests.post(RAP_16DAY_URL, json=payload, timeout=HTTP_TIMEOUT_SEC)
+    r.raise_for_status()
+    data = r.json()
+    rows = data.get("properties", {}).get("production16day", [])
+    return rows  # first row is header: ["date","year","doy","AFG","PFG","HER"]
 
-# ── Init EE ───────────────────────────────────────────────────────────────────
-EE_READY = False
-try:
-    if EE_SERVICE_ACCOUNT and EE_PRIVATE_KEY_FILE:
-        creds = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, EE_PRIVATE_KEY_FILE)
-        ee.Initialize(creds)
-    else:
-        ee.Initialize()
-    EE_READY = True
-except Exception as e:
-    print("EE init failed:", e)
 
+def parse_latest_rap_row(rows: list) -> dict:
+    """
+    Extract the most recent non-zero 16-day production row.
+    Returns dict with keys: date, afgNPP_latest, pfgNPP_latest, HER_latest
+    """
+    if len(rows) < 2:
+        return {}
+    # rows[0] is header, rows[1:] are data newest-last
+    # Find the last row with non-null HER value
+    header = rows[0]
+    try:
+        date_idx = header.index("date")
+        afg_idx  = header.index("AFG")
+        pfg_idx  = header.index("PFG")
+        her_idx  = header.index("HER")
+    except ValueError:
+        return {}
+
+    latest = None
+    for row in reversed(rows[1:]):
+        her_val = safe_num(row[her_idx])
+        if her_val is not None:
+            latest = row
+            break
+
+    if not latest:
+        return {}
+
+    return {
+        "date":           latest[date_idx],
+        "afgNPP_latest":  safe_num(latest[afg_idx]),
+        "pfgNPP_latest":  safe_num(latest[pfg_idx]),
+        "HER_latest":     safe_num(latest[her_idx]),
+    }
+
+# ── Startup data load ─────────────────────────────────────────────────────────
 NORMALS_DF: Optional[pd.DataFrame] = None
 try:
     NORMALS_DF = load_normals(NORMALS_CSV)
@@ -155,102 +175,80 @@ except Exception as e:
 # ── Core compute (background thread only) ────────────────────────────────────
 def _compute_all_conus():
     """
-    For each GACC, splits PSAs into sub-batches of SUB_BATCH_SIZE (default 15)
-    and runs a separate reduceRegions call per batch. This keeps each GEE call
-    small enough to complete within the computation timeout — critical for large
-    GACCs like USGASAC (56 PSAs → 4 batches of ~14).
+    For each PSA polygon, calls the RAP production16dayV3 API to get the
+    latest 16-day AFG/PFG/HER values, then compares against normals.
+    25 CA PSA API calls, ~15 sec with 0.5s delay. No GEE required.
     """
-    print(f"Cache: starting CONUS computation (sub_batch={SUB_BATCH_SIZE}) ...")
+    print("Cache: starting CA PSA computation via RAP API ...")
     try:
-        if not EE_READY:
-            raise RuntimeError("Earth Engine not initialized")
         if NORMALS_DF is None or NORMALS_DF.empty:
             raise RuntimeError("Normals table not loaded")
         if not LITE_FEATURES:
             raise RuntimeError("Lite GeoJSON not loaded")
 
-        coll        = ee.ImageCollection(EE_COLLECTION_16D_PROV).sort("system:time_start", False)
-        latest      = coll.first()
-        latest_date = ee.Date(latest.get("system:time_start")).format("YYYY-MM-dd").getInfo()
-        print(f"Cache: latest composite = {latest_date}")
-
-        img   = latest.select(["afgNPP","pfgNPP"])
-        her   = img.select("afgNPP").add(img.select("pfgNPP")).rename("HER")
-        stack = img.addBands(her)
-
+        current_year = datetime.datetime.utcnow().year
         all_latest_rows = []
         gacc_progress   = {}
+        latest_date_seen = None
 
         for gacc in GACC_CODES:
             print(f"Cache: processing {gacc} ...")
-
-            # Collect all lite features for this GACC
             gacc_features = [
                 f for f in LITE_FEATURES
                 if str((f.get("properties") or {}).get("GACCUnitID", "")).strip() == gacc
             ]
-
             if not gacc_features:
-                print(f"Cache: {gacc} — 0 features in lite GeoJSON, skipping")
                 gacc_progress[gacc] = {"status": "skipped", "psas": 0}
                 continue
 
-            # Split into sub-batches
-            batches = [
-                gacc_features[i:i + SUB_BATCH_SIZE]
-                for i in range(0, len(gacc_features), SUB_BATCH_SIZE)
-            ]
-            print(f"Cache: {gacc} — {len(gacc_features)} PSAs in {len(batches)} batch(es)")
+            gacc_rows    = []
+            gacc_errors  = []
 
-            gacc_rows   = []
-            batch_errors = []
+            for feat in gacc_features:
+                props    = feat.get("properties", {}) or {}
+                psa_code = str(props.get("PSANationalCode", props.get("PSA_NAT_CODE",""))).strip().upper()
+                psaname  = props.get("PSANAME", props.get("PSA_NAME",""))
+                geom     = feat.get("geometry")
 
-            for batch_idx, batch in enumerate(batches):
+                if not geom or is_junk_psa(psa_code):
+                    continue
                 try:
-                    psa_fc   = build_ee_fc(batch)
-                    stats_fc = stack.reduceRegions(
-                        collection=psa_fc,
-                        reducer=ee.Reducer.mean(),
-                        scale=90,
-                        tileScale=16,
-                    )
-                    stats = stats_fc.getInfo().get("features", [])
-                    print(f"Cache: {gacc} batch {batch_idx+1}/{len(batches)} — {len(stats)} results")
-
-                    for f in stats:
-                        p = f.get("properties", {}) or {}
+                    rows   = fetch_rap_16day(geom, year=current_year)
+                    parsed = parse_latest_rap_row(rows)
+                    if parsed:
+                        if latest_date_seen is None or parsed["date"] > latest_date_seen:
+                            latest_date_seen = parsed["date"]
                         gacc_rows.append({
-                            "PSA_KEY":         p.get("PSA_KEY"),
-                            "PSANationalCode": p.get("PSANationalCode"),
-                            "PSANAME":         p.get("PSANAME"),
-                            "GACCUnitID":      p.get("GACCUnitID"),
-                            "afgNPP_latest":   safe_num(p.get("afgNPP")),
-                            "pfgNPP_latest":   safe_num(p.get("pfgNPP")),
-                            "HER_latest":      safe_num(p.get("HER")),
+                            "PSA_KEY":         psa_code,
+                            "PSANationalCode": psa_code,
+                            "PSANAME":         psaname,
+                            "GACCUnitID":      gacc,
+                            "afgNPP_latest":   parsed["afgNPP_latest"],
+                            "pfgNPP_latest":   parsed["pfgNPP_latest"],
+                            "HER_latest":      parsed["HER_latest"],
                         })
+                    else:
+                        print(f"  {psa_code}: no valid production data returned")
+                except Exception as psa_exc:
+                    print(f"  {psa_code} failed: {psa_exc}")
+                    gacc_errors.append(f"{psa_code}: {psa_exc}")
 
-                except Exception as batch_exc:
-                    print(f"Cache: {gacc} batch {batch_idx+1} failed — {batch_exc}")
-                    batch_errors.append(f"batch {batch_idx+1}: {batch_exc}")
-
-                finally:
-                    gc.collect()
+                time.sleep(RAP_REQUEST_DELAY)
 
             all_latest_rows.extend(gacc_rows)
-
-            if batch_errors:
+            if gacc_errors:
                 gacc_progress[gacc] = {
-                    "status":  "partial" if gacc_rows else "error",
-                    "psas":    len(gacc_rows),
-                    "errors":  batch_errors,
+                    "status": "partial" if gacc_rows else "error",
+                    "psas": len(gacc_rows), "errors": gacc_errors[:3],
                 }
             else:
                 gacc_progress[gacc] = {"status": "ok", "psas": len(gacc_rows)}
 
-        # ── Merge with normals ────────────────────────────────────────────────
+            gc.collect()
+
         latest_df = pd.DataFrame(all_latest_rows)
         if latest_df.empty:
-            raise RuntimeError("No PSA results returned from any GACC")
+            raise RuntimeError("No PSA results returned from RAP API")
 
         merged = pd.merge(latest_df, NORMALS_DF, on="PSA_KEY", how="left", suffixes=("","_norms"))
         merged["above_normal"] = pd.NA
@@ -277,13 +275,13 @@ def _compute_all_conus():
 
         with _CACHE_LOCK:
             _CACHE["rows"]             = rows
-            _CACHE["latest_composite"] = latest_date
+            _CACHE["latest_composite"] = latest_date_seen
             _CACHE["computed_at"]      = datetime.datetime.utcnow().isoformat() + "Z"
             _CACHE["status"]           = "ready"
             _CACHE["error"]            = None
             _CACHE["gacc_progress"]    = gacc_progress
 
-        print(f"Cache: ready — {len(rows)} PSA rows stored")
+        print(f"Cache: ready — {len(rows)} PSA rows stored, latest composite = {latest_date_seen}")
 
     except Exception as exc:
         print(f"Cache: compute failed — {exc}")
@@ -299,21 +297,22 @@ def _cache_refresh_loop():
         time.sleep(CACHE_REFRESH_HOURS * 3600)
 
 
-if EE_READY and NORMALS_DF is not None and LITE_FEATURES:
+if NORMALS_DF is not None and LITE_FEATURES:
     t = threading.Thread(target=_cache_refresh_loop, daemon=True)
     t.start()
     print("Cache: background refresh thread started")
 else:
-    print("Cache: skipping background thread (EE, normals, or lite GeoJSON not ready)")
+    print("Cache: skipping background thread (normals or lite GeoJSON not ready)")
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/", response_class=PlainTextResponse)
 def root():
     return (
-        "CONUS PSA Herbaceous API v12\n\n"
+        "California PSA Herbaceous API v14 (RAP API — no GEE)\n\n"
         "Endpoints:\n"
-        "  /psa_flags                  All CONUS (served from cache)\n"
+        "  /psa_flags                  All CA PSAs (served from cache)\n"
         "  /psa_flags?gaccs=USCAONCC  Filter by GACC (comma-separated)\n"
+        "  /psa_flags?gaccs=USCAOSCC  California South only\n"
         "  /psa_flags?pretty=1         Human-readable JSON\n"
         "  /health                     Cache status + per-GACC progress\n"
     )
@@ -330,12 +329,11 @@ def health():
         gacc_progress   = dict(_CACHE["gacc_progress"])
     return {
         "status":            "ok",
-        "ee_initialized":    EE_READY,
         "normals_csv":       NORMALS_CSV,
         "normals_rows":      len(NORMALS_DF) if NORMALS_DF is not None else 0,
         "lite_geojson":      PSA_LITE_GEOJSON,
         "lite_features":     len(LITE_FEATURES),
-        "sub_batch_size":    SUB_BATCH_SIZE,
+        "data_source":       "RAP public API (no GEE)",
         "cache_status":      cache_status,
         "cache_psa_rows":    cache_rows,
         "cache_computed_at": cache_computed,
@@ -355,11 +353,16 @@ def psa_flags(
         rows     = list(_CACHE["rows"])
         latest   = _CACHE["latest_composite"]
         computed = _CACHE["computed_at"]
+        error    = _CACHE["error"]
 
     if status == "starting":
-        raise HTTPException(status_code=503, detail="Cache is still computing — try again in a few minutes.")
-    if status == "error":
-        raise HTTPException(status_code=500, detail=f"Cache compute failed: {_CACHE['error']}")
+        raise HTTPException(status_code=503,
+            detail="Cache is still computing — try again in a few minutes.")
+
+    # Serve stale data if available, with a warning
+    if status == "error" and not rows:
+        raise HTTPException(status_code=500,
+            detail=f"Cache compute failed and no data available: {error}")
 
     gacc_list = parse_gaccs_param(gaccs)
     if gacc_list:
@@ -369,11 +372,17 @@ def psa_flags(
     payload = {
         "count":            len(rows),
         "gaccs":            gacc_list if gacc_list else result_gaccs,
-        "collection":       EE_COLLECTION_16D_PROV,
+        "data_source":      "RAP public API",
         "latest_composite": latest,
         "cache_computed_at":computed,
         "rows":             rows,
     }
+
+    if status == "error":
+        payload["cache_warning"] = (
+            f"Cache refresh failed — serving last known data from {computed}. "
+            f"Error: {error}"
+        )
 
     if bool(pretty):
         return PlainTextResponse(json.dumps(payload, indent=2), media_type="application/json")
